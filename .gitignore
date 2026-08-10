@@ -1,0 +1,35 @@
+# Models & checkpoints (also symlinks)
+models
+models/
+checkpoints/
+logs/
+results/
+*.pt
+*.bin
+*.safetensors
+
+# Data (large files; regenerate with convert_confiqa.py)
+data
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# IDE & tools
+.vscode/
+.claude/
+.idea/
+
+# Experiment planning (internal only)
+prototype-experiment.md
+
+# W&B
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
