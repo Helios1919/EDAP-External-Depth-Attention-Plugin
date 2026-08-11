@@ -5,6 +5,7 @@ checkpoints/
 logs/
 results/
 *.pt
+*.pth
 *.bin
 *.safetensors
 
@@ -18,6 +19,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
+.ipynb_checkpoints/
 
 # IDE & tools
 .vscode/
@@ -29,6 +31,9 @@ prototype-experiment.md
 
 # W&B
 wandb/
+
+# Logs
+*.log
 
 # OS
 .DS_Store

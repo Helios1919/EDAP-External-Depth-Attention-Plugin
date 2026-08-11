@@ -23,14 +23,14 @@ parser.add_argument("--data_path", default="./data/confiqa/confiqa_train.json")
 parser.add_argument("--output_dir", default="./checkpoints")
 parser.add_argument("--log_dir", default="./logs")
 parser.add_argument("--edap_blocks", type=int, default=4)
-parser.add_argument("--edap_heads", type=int, default=4)
-parser.add_argument("--epochs", type=int, default=3)
+parser.add_argument("--edap_heads", type=int, default=8)
+parser.add_argument("--epochs", type=int, default=5)
 parser.add_argument("--batch_size", type=int, default=8,
                     help="A100 default 8; reduce to 2 for V100-32GB")
 parser.add_argument("--grad_accum", type=int, default=2,
                     help="effective batch = batch_size * grad_accum (16 for A100)")
 parser.add_argument("--lr", type=float, default=1e-4)
-parser.add_argument("--warmup_steps", type=int, default=100)
+parser.add_argument("--warmup_steps", type=int, default=50)
 parser.add_argument("--weight_decay", type=float, default=0.01)
 parser.add_argument("--max_seq_length", type=int, default=1024)
 parser.add_argument("--val_split", type=float, default=0.2,

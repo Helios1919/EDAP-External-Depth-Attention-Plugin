@@ -15,13 +15,13 @@ Block 2 → [EDAP₂] → r'₂ ─┼─→ Trainable LM Head → Answer
 Block 3 → [EDAP₃] → r'₃ ─┘
 ```
 
-Each EDAP plugin: 4-head cross-depth attention with 3× LayerNorm (input, key, output) and learnable depth position embeddings.
+Each EDAP plugin: 8-head cross-depth attention with 3× LayerNorm (input, key, output) and learnable depth position embeddings.
 
 | Component | Params |
 |-----------|--------|
-| EDAP plugins (4×) | 206M |
+| EDAP plugins (4×) | ~410M |
 | LM head (unfrozen) | 545M |
-| **Total trainable** | **751M (9.9% of backbone)** |
+| **Total trainable** | **~955M (12.5% of backbone)** |
 | Qwen2.5-7B backbone | 7.6B (frozen) |
 
 ## Quick Start
@@ -53,12 +53,12 @@ python src/evaluate.py --baseline cad
 python src/evaluate.py --baseline dola
 
 # 6. Evaluate trained EDAP
-python src/evaluate.py --checkpoint ./checkpoints/edap_epoch3.pt
+python src/evaluate.py --checkpoint ./checkpoints/edap_epoch5.pt
 
 # 7. Generate full comparison report
 python src/report.py \
-    --edap_ckpt checkpoints/edap_epoch3.pt \
-    --edap_random_ckpt checkpoints/edap_random_epoch3.pt
+    --edap_ckpt checkpoints/edap_epoch5.pt \
+    --edap_random_ckpt checkpoints/edap_random_epoch5.pt
 ```
 
 ### Training Notes
@@ -116,7 +116,7 @@ EDAP/
 ## Key Design Decisions
 
 - **Multi-plugin chain**: 4 plugins at block boundaries for incremental calibration
-- **Multi-head (H=4)**: dimension split across heads for nuanced attention
+- **Multi-head (H=8)**: dimension split across heads for nuanced attention
 - **Three LayerNorms**: Input (depth magnitude), Key (attention stability), Output (residual preservation)
 - **Zero-init W_O**: Plugin starts as identity mapping, learns to deviate only where needed
 - **Unfrozen lm_head**: Required for gradient pathway through frozen backbone
