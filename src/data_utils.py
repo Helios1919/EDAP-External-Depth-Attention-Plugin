@@ -96,11 +96,16 @@ class ConFiQADataset(Dataset):
         labels = tokens["input_ids"].clone()
         labels[0, :p_len] = -100
 
+        # Find last non-padding position (the true end of the answer)
+        non_pad_mask = (tokens["input_ids"][0] != self.tokenizer.pad_token_id)
+        last_answer_pos = non_pad_mask.nonzero(as_tuple=True)[0][-1].item()
+
         return {
             "input_ids": tokens["input_ids"][0],
             "attention_mask": tokens["attention_mask"][0],
             "labels": labels[0],
             "prompt_len": p_len,
+            "last_answer_pos": last_answer_pos,
         }
 
 
@@ -158,6 +163,7 @@ def collate_fn(batch):
         "input_ids": torch.stack([x["input_ids"] for x in batch]),
         "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
         "labels": torch.stack([x["labels"] for x in batch]),
+        "last_answer_pos": torch.tensor([x["last_answer_pos"] for x in batch], dtype=torch.long),
     }
 
 

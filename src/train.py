@@ -159,11 +159,14 @@ for epoch in range(args.epochs):
             r_fused, _ = plug(sources, shuffle_depth=args.shuffle_depth)
             r_prev.append(r_fused)
 
-        # last-token prediction
-        logits = model.lm_head(r_prev[-1][:, -1, :]).unsqueeze(1)
+        # last-token prediction using the true answer end position
+        last_pos = batch["last_answer_pos"].to(device)  # [B]
+        B = last_pos.size(0)
+        idx = torch.arange(B, device=device)
+        logits = model.lm_head(r_prev[-1][idx, last_pos, :]).unsqueeze(1)
 
         loss = F.cross_entropy(
-            logits.squeeze(1), labels[:, -1], ignore_index=-100
+            logits.squeeze(1), labels[idx, last_pos], ignore_index=-100
         )
         loss = loss / args.grad_accum
         loss.backward()
