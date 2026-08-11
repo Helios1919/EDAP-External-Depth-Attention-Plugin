@@ -20,7 +20,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", default="Qwen/Qwen2.5-7B")
 parser.add_argument("--model_path", default="./models/qwen2.5-7b")
 parser.add_argument("--data_path", default="./data/confiqa/confiqa_train.json")
-parser.add_argument("--output_dir", default="./checkpoints")
+parser.add_argument("--output_dir", default="./checkpoints",
+                    help="Default auto-uses /root/autodl-tmp/ if available")
 parser.add_argument("--log_dir", default="./logs")
 parser.add_argument("--edap_blocks", type=int, default=4)
 parser.add_argument("--edap_heads", type=int, default=8)
@@ -50,6 +51,11 @@ args = parser.parse_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # V100 不支持 bf16，自动回退到 fp16；A100/H100 则用 bf16
 COMPUTE_DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
+# Auto-detect data disk for checkpoints (avoid filling system disk)
+if args.output_dir == "./checkpoints" and os.path.isdir("/root/autodl-tmp"):
+    args.output_dir = "/root/autodl-tmp/checkpoints"
+
 print(f"Device: {device}")
 print(f"Compute dtype: {COMPUTE_DTYPE}")
 print(f"Mode: {'EDAP-random' if args.shuffle_depth else 'EDAP'}")
@@ -273,26 +279,46 @@ for epoch in range(args.epochs):
             else:
                 patience_counter += 1
                 print(f"Val loss did not improve ({patience_counter}/{args.early_stop_patience})")
-                if patience_counter >= args.early_stop_patience:
-                    print(f"Early stopping at epoch {epoch+1} (best: epoch {best_epoch}, val_loss={best_val_loss:.4f})")
-                    break
-        edap_plugins.train()
 
-    # save after every epoch in case the run dies mid-training
-    os.makedirs(args.output_dir, exist_ok=True)
-    tag = "edap_random" if args.shuffle_depth else "edap"
-    ckpt_path = Path(args.output_dir) / f"{tag}_epoch{epoch+1}.pt"
-    torch.save({
-        "epoch": epoch + 1,
-        "edap_plugins": edap_plugins.state_dict(),
-        "lm_head": {n: p for n, p in model.named_parameters()
-                    if "lm_head" in n and p.requires_grad},
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "global_step": global_step,
-        "config": vars(args),
-    }, ckpt_path)
-    print(f"Checkpoint -> {ckpt_path}")
+        # ---- save checkpoint (only best model, no optimizer to save space) ----
+        is_best = (val_loss == best_val_loss)
+        if is_best and val_loader is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+            tag = "edap_random" if args.shuffle_depth else "edap"
+            ckpt_path = Path(args.output_dir) / f"{tag}_best.pt"
+            # Remove old best checkpoint if exists
+            for old in Path(args.output_dir).glob(f"{tag}_best*.pt"):
+                old.unlink()
+            torch.save({
+                "epoch": epoch + 1,
+                "edap_plugins": edap_plugins.state_dict(),
+                "lm_head": {n: p.clone() for n, p in model.named_parameters()
+                            if "lm_head" in n and p.requires_grad},
+                "val_loss": val_loss,
+                "global_step": global_step,
+                "config": vars(args),
+            }, ckpt_path)
+            print(f"Best checkpoint -> {ckpt_path} (val_loss={val_loss:.4f})")
+
+            # Also save a resume checkpoint with optimizer state
+            resume_path = Path(args.output_dir) / f"{tag}_resume.pt"
+            torch.save({
+                "epoch": epoch + 1,
+                "edap_plugins": edap_plugins.state_dict(),
+                "lm_head": {n: p.clone() for n, p in model.named_parameters()
+                            if "lm_head" in n and p.requires_grad},
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "val_loss": val_loss,
+                "global_step": global_step,
+                "config": vars(args),
+            }, resume_path)
+
+        if args.early_stop_patience > 0 and patience_counter >= args.early_stop_patience:
+            print(f"Early stopping at epoch {epoch+1} (best: epoch {best_epoch}, val_loss={best_val_loss:.4f})")
+            break
+
+        edap_plugins.train()
 
 for h in hooks:
     h.remove()
