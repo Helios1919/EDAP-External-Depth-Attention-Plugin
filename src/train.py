@@ -30,7 +30,7 @@ parser.add_argument("--batch_size", type=int, default=8,
 parser.add_argument("--grad_accum", type=int, default=2,
                     help="effective batch = batch_size * grad_accum (16 for A100)")
 parser.add_argument("--lr", type=float, default=1e-4)
-parser.add_argument("--warmup_steps", type=int, default=50)
+parser.add_argument("--warmup_steps", type=int, default=450)
 parser.add_argument("--weight_decay", type=float, default=0.01)
 parser.add_argument("--max_seq_length", type=int, default=1024)
 parser.add_argument("--val_split", type=float, default=0.2,
