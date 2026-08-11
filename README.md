@@ -37,11 +37,17 @@ python scripts/convert_confiqa.py
 # 3. Quick debug run (100 samples, 3 steps)
 python src/train.py --dry_run
 
-# 4. Full training
+# 4. Full training (A100 defaults: batch=8, grad_accum=2)
 python src/train.py                      # EDAP
 python src/train.py --shuffle_depth      # EDAP-random (control)
 
-# 5. Evaluate baselines
+#   V100 fallback:
+#   python src/train.py --batch_size 2 --grad_accum 8
+
+#   Skip validation split (train on all data):
+#   python src/train.py --val_split 0
+
+# 5. Evaluate baselines (multi-token greedy generation)
 python src/evaluate.py --baseline greedy
 python src/evaluate.py --baseline cad
 python src/evaluate.py --baseline dola
@@ -55,10 +61,24 @@ python src/report.py \
     --edap_random_ckpt checkpoints/edap_random_epoch3.pt
 ```
 
+### Training Notes
+
+- **Full-sequence loss**: Uses teacher-forcing over all answer tokens (not single-token), fixing the loss→0 overfitting problem
+- **Validation split**: Default 20% held out (`--val_split 0.2`); val loss logged per epoch for overfitting monitoring
+- **Auto dtype**: Detects bf16 support (A100) vs fp16 fallback (V100)
+- **Checkpointing**: Saved after every epoch to `--output_dir` (default `./checkpoints`)
+
+### Evaluation Notes
+
+- All methods (EDAP, Greedy, CAD, DoLa) use **multi-token greedy generation** — not single-token argmax — for a fair comparison
+- Exact match (EM) is computed after normalizing whitespace and punctuation
+- Results broken down by `correct_source` (context vs memory) and saved as JSON
+
 ## Requirements
 
 - Python 3.12+
-- CUDA-capable GPU (V100 32GB minimum; A100 40GB recommended)
+- **A100 40GB / 80GB recommended** (native bf16, batch_size=8)
+- V100 32GB works but needs manual override: `--batch_size 2 --grad_accum 8`
 - See `environment.yml` or `requirements.txt` for Python dependencies
 
 ## Data
