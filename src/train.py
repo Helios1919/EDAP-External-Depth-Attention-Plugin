@@ -320,6 +320,8 @@ for epoch in range(args.epochs):
 
         edap_plugins.train()
 
+        edap_plugins.train()
+
 for h in hooks:
     h.remove()
 if args.wandb:

@@ -19,9 +19,9 @@ Each EDAP plugin: 8-head cross-depth attention with 3× LayerNorm (input, key, o
 
 | Component | Params |
 |-----------|--------|
-| EDAP plugins (4×) | ~410M |
+| EDAP plugins (4×) | 206M |
 | LM head (unfrozen) | 545M |
-| **Total trainable** | **~955M (12.5% of backbone)** |
+| **Total trainable** | **751M (9.9% of backbone)** |
 | Qwen2.5-7B backbone | 7.6B (frozen) |
 
 ## Quick Start
