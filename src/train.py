@@ -25,12 +25,16 @@ parser.add_argument("--log_dir", default="./logs")
 parser.add_argument("--edap_blocks", type=int, default=4)
 parser.add_argument("--edap_heads", type=int, default=4)
 parser.add_argument("--epochs", type=int, default=3)
-parser.add_argument("--batch_size", type=int, default=2)
-parser.add_argument("--grad_accum", type=int, default=8)
+parser.add_argument("--batch_size", type=int, default=8,
+                    help="A100 default 8; reduce to 2 for V100-32GB")
+parser.add_argument("--grad_accum", type=int, default=2,
+                    help="effective batch = batch_size * grad_accum (16 for A100)")
 parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--warmup_steps", type=int, default=100)
 parser.add_argument("--weight_decay", type=float, default=0.01)
 parser.add_argument("--max_seq_length", type=int, default=1024)
+parser.add_argument("--val_split", type=float, default=0.2,
+                    help="Fraction of training data held out for validation")
 parser.add_argument("--shuffle_depth", action="store_true")
 parser.add_argument("--dry_run", action="store_true")
 parser.add_argument("--wandb", action="store_true", default=False)
@@ -112,8 +116,22 @@ train_dataset = ConFiQADataset(
     augment_counterfactual=True,
     tokenizer=tokenizer, max_seq_length=args.max_seq_length,
 )
-train_loader = create_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True)
-print(f"Train samples: {len(train_dataset)}")
+
+# ---- validation split ----
+if args.val_split > 0:
+    n_val = int(len(train_dataset) * args.val_split)
+    n_train = len(train_dataset) - n_val
+    train_subset, val_subset = torch.utils.data.random_split(
+        train_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+    train_loader = create_dataloader(train_subset, batch_size=args.batch_size, shuffle=True)
+    val_loader = create_dataloader(val_subset, batch_size=args.batch_size, shuffle=False)
+    print(f"Train: {n_train}  Val: {n_val}")
+else:
+    train_loader = create_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = None
+    print(f"Train samples: {len(train_dataset)} (no val split)")
 
 # -- optimizer -------------------------------------------------------
 
@@ -159,14 +177,16 @@ for epoch in range(args.epochs):
             r_fused, _ = plug(sources, shuffle_depth=args.shuffle_depth)
             r_prev.append(r_fused)
 
-        # last-token prediction using the true answer end position
-        last_pos = batch["last_answer_pos"].to(device)  # [B]
-        B = last_pos.size(0)
-        idx = torch.arange(B, device=device)
-        logits = model.lm_head(r_prev[-1][idx, last_pos, :]).unsqueeze(1)
-
+        # Full-sequence teacher-forcing loss over all answer tokens
+        # r_prev[-1]: [B, S, d] → lm_head → [B, S, V]
+        logits = model.lm_head(r_prev[-1])  # [B, S, vocab]
+        # Shift: predict token[t] from hidden[t-1]
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
         loss = F.cross_entropy(
-            logits.squeeze(1), labels[idx, last_pos], ignore_index=-100
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
         )
         loss = loss / args.grad_accum
         loss.backward()
@@ -195,6 +215,43 @@ for epoch in range(args.epochs):
         break
 
     print(f"=== Epoch {epoch+1} done, avg loss {epoch_loss / len(train_loader):.4f} ===")
+
+    # ---- validation ----
+    if val_loader is not None:
+        model.eval()
+        edap_plugins.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                labels = batch["labels"].to(device)
+                attn_mask = batch["attention_mask"].to(device)
+
+                block_exits.clear()
+                emb = model.model.embed_tokens(input_ids)
+                _ = model.model(inputs_embeds=emb, attention_mask=attn_mask)
+
+                r_prev = [emb.detach().to(COMPUTE_DTYPE)]
+                for r_blk, plug in zip(block_exits, edap_plugins):
+                    sources = r_prev + [r_blk.to(COMPUTE_DTYPE)]
+                    r_fused, _ = plug(sources, shuffle_depth=args.shuffle_depth)
+                    r_prev.append(r_fused)
+
+                logits = model.lm_head(r_prev[-1])
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = labels[:, 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+        print(f"=== Val loss: {val_loss:.4f} ===")
+        if args.wandb:
+            wandb.log({"val/loss": val_loss}, step=global_step)
+        edap_plugins.train()
 
     # save after every epoch in case the run dies mid-training
     os.makedirs(args.output_dir, exist_ok=True)
