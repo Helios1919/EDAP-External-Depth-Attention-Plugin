@@ -50,12 +50,15 @@ class ConFiQADataset(Dataset):
         ci = [s for s in raw if s.get("type") == "context_irrelevant"]
         cc = [s for s in raw if s.get("type") == "counterfactual"]
 
-        self.samples.extend(cc[:2000])
-        self.samples.extend(cr[:1500])
-        self.samples.extend(ci[:1500])
+        # Use all available data (no hardcoded caps)
+        self.samples.extend(cc)
+        self.samples.extend(cr)
+        self.samples.extend(ci)
+        print(f"Samples: cc={len(cc)} cr={len(cr)} ci={len(ci)} (total={len(self.samples)})")
 
         if augment_counterfactual:
-            for s in cc[:2000]:
+            n_flipped = 0
+            for s in cc:
                 # only flip samples that have a correct-context variant
                 if "context_correct" not in s or "context_answer" not in s:
                     continue
@@ -65,6 +68,8 @@ class ConFiQADataset(Dataset):
                 flipped["correct_source"] = "context"
                 flipped["_flipped"] = True
                 self.samples.append(flipped)
+                n_flipped += 1
+            print(f"Augmented: {n_flipped} flipped samples (total={len(self.samples)})")
 
         random.shuffle(self.samples)
 

@@ -24,6 +24,8 @@ parser.add_argument("--output_dir", default="./checkpoints")
 parser.add_argument("--log_dir", default="./logs")
 parser.add_argument("--edap_blocks", type=int, default=4)
 parser.add_argument("--edap_heads", type=int, default=8)
+parser.add_argument("--edap_dropout", type=float, default=0.1,
+                    help="Dropout rate in EDAP plugins")
 parser.add_argument("--epochs", type=int, default=5)
 parser.add_argument("--batch_size", type=int, default=8,
                     help="A100 default 8; reduce to 2 for V100-32GB")
@@ -32,9 +34,13 @@ parser.add_argument("--grad_accum", type=int, default=2,
 parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--warmup_steps", type=int, default=450)
 parser.add_argument("--weight_decay", type=float, default=0.01)
+parser.add_argument("--label_smoothing", type=float, default=0.1,
+                    help="Label smoothing for cross-entropy (0 = off)")
 parser.add_argument("--max_seq_length", type=int, default=1024)
 parser.add_argument("--val_split", type=float, default=0.2,
                     help="Fraction of training data held out for validation")
+parser.add_argument("--early_stop_patience", type=int, default=2,
+                    help="Stop if val loss doesn't improve for N epochs (0 = off)")
 parser.add_argument("--shuffle_depth", action="store_true")
 parser.add_argument("--dry_run", action="store_true")
 parser.add_argument("--wandb", action="store_true", default=False)
@@ -102,6 +108,7 @@ edap_plugins = create_edap_plugins(
     d_model=model.config.hidden_size,
     n_heads=args.edap_heads,
     n_blocks=args.edap_blocks,
+    dropout=args.edap_dropout,
 ).to(device).to(COMPUTE_DTYPE)
 
 n_edap_params = sum(p.numel() for p in edap_plugins.parameters())
@@ -153,6 +160,9 @@ scheduler = LambdaLR(optimizer, _lr_lambda)
 
 print(f"\nTraining: {args.epochs} epochs, {len(train_loader)} steps/epoch\n")
 global_step = 0
+best_val_loss = float("inf")
+patience_counter = 0
+best_epoch = 0
 model.eval()  # no dropout in frozen backbone
 
 for epoch in range(args.epochs):
@@ -187,6 +197,7 @@ for epoch in range(args.epochs):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
+            label_smoothing=args.label_smoothing,
         )
         loss = loss / args.grad_accum
         loss.backward()
@@ -244,6 +255,7 @@ for epoch in range(args.epochs):
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_labels.view(-1),
                     ignore_index=-100,
+                    label_smoothing=args.label_smoothing,
                 )
                 val_loss += loss.item()
 
@@ -251,6 +263,19 @@ for epoch in range(args.epochs):
         print(f"=== Val loss: {val_loss:.4f} ===")
         if args.wandb:
             wandb.log({"val/loss": val_loss}, step=global_step)
+
+        # ---- early stopping ----
+        if args.early_stop_patience > 0:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_epoch = epoch + 1
+            else:
+                patience_counter += 1
+                print(f"Val loss did not improve ({patience_counter}/{args.early_stop_patience})")
+                if patience_counter >= args.early_stop_patience:
+                    print(f"Early stopping at epoch {epoch+1} (best: epoch {best_epoch}, val_loss={best_val_loss:.4f})")
+                    break
         edap_plugins.train()
 
     # save after every epoch in case the run dies mid-training

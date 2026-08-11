@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 class EDAPPlugin(nn.Module):
 
-    def __init__(self, n_sources: int, d_model: int = 3584, n_heads: int = 4):
+    def __init__(self, n_sources: int, d_model: int = 3584, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_sources = n_sources
@@ -24,6 +24,8 @@ class EDAPPlugin(nn.Module):
         self.norm_in = nn.LayerNorm(d_model)
         self.norm_k = nn.LayerNorm(d_total)
         self.norm_out = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
 
         self.depth_embed = nn.Parameter(torch.randn(n_sources, d_total) * 0.02)
 
@@ -71,19 +73,19 @@ class EDAPPlugin(nn.Module):
         out = torch.matmul(weights, V).squeeze(3)  # [B,S,H,d]
         out = out.reshape(B, S, -1)
 
-        delta = self.W_O(self.norm_out(out))
+        delta = self.W_O(self.norm_out(self.dropout(out)))
         r_out = sources[-1] + delta
 
         return r_out, weights.squeeze(3)
 
 
-def create_edap_plugins(d_model=3584, n_heads=4, n_blocks=4):
+def create_edap_plugins(d_model=3584, n_heads=4, n_blocks=4, dropout=0.1):
     """Build one EDAP plugin per block boundary.
 
     Plugin i sees: embedding + all previous calibrated residuals + current block.
     So n_sources goes 2, 3, 4, 5 for 4 blocks.
     """
     return nn.ModuleList([
-        EDAPPlugin(n_sources=i + 2, d_model=d_model, n_heads=n_heads)
+        EDAPPlugin(n_sources=i + 2, d_model=d_model, n_heads=n_heads, dropout=dropout)
         for i in range(n_blocks)
     ])
