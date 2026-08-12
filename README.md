@@ -8,9 +8,10 @@ When a language model's parametric (memorized) knowledge contradicts external co
 
 ```
   Input ──→ [L0..L3] ──→ [EDAP₀] ──→ [L4..L7] ──→ [EDAP₁] ──→ ... ──→ [L24..L27] ──→ [EDAP₆] ──→ LM Head ──→ Answer
-               └─ frozen ─┘ └ trainable ┘└─ frozen ─┘ └ trainable ┘       └── frozen ──┘ └ trainable ┘
+               └─ frozen ─┘ └ trainable ┘                                 └── frozen ──┘ └ trainable ┘
 ```
-> 7 backbone blocks (4 layers each, frozen) alternating with 7 EDAP plugins (trainable).
+> Qwen2.5-7B (28 layers) → 7 blocks (4 layers each, frozen) alternating with 7 EDAP plugins (trainable).  
+> Block boundaries configurable via `--edap_blocks` or `--block_layers`.
 
 > **Each EDAPₖ is a miniature cross-attention block:**
 >
@@ -39,54 +40,55 @@ When a language model's parametric (memorized) knowledge contradicts external co
 ## Quick Start
 
 ```bash
-# 1. Setup environment (conda env + model + raw data)
-bash scripts/setup.sh
-conda activate edap
+# 1. Setup
+bash scripts/setup.sh && conda activate edap
 
-# 2. Prepare data (official ConFiQA → training format)
+# 2. Prepare data
 python scripts/convert_confiqa.py
 
-# 3. Quick debug run (100 samples, 3 steps)
+# 3. Dry run (100 samples, 3 steps)
 python src/train.py --dry_run
 
-# 4. Full training (A100-40GB: batch=1, grad_accum=16, effective batch=16)
-python src/train.py
+# 4. Full training (A100-40GB)
+python src/train.py --freeze_lm_head
 
-#   A100-80GB (more headroom):
-#   python src/train.py --batch_size 2 --grad_accum 8
+#   Recommended flags:
+#   --freeze_lm_head       prevent 545M lm_head from memorizing dataset biases
+#   --batch_size 2 --grad_accum 8   for A100-80GB
+#   --edap_noise 0                  disable exposure-bias noise
+#   --val_split 0                   train on all data
 
-#   V100-32GB (fp16 auto-fallback):
-#   python src/train.py --batch_size 1 --grad_accum 16
-
-#   Skip validation split (train on all data):
-#   python src/train.py --val_split 0
-
-# 5. Evaluate all methods (runs on both NQ-Swap & ConFiQA, 500 samples each)
+# 5. Evaluate baselines
 python src/evaluate.py --baseline greedy  --max_samples 500
 python src/evaluate.py --baseline cad     --max_samples 500
 python src/evaluate.py --baseline dola    --max_samples 500
-python src/evaluate.py --checkpoint ./checkpoints/edap_best.pt --max_samples 500
+python src/evaluate.py --checkpoint /root/autodl-tmp/checkpoints/edap_best.pt --max_samples 500
+
+# 6. Generate comparison report
+python src/report.py --edap_ckpt /root/autodl-tmp/checkpoints/edap_best.pt \
+                      --edap_random_ckpt /root/autodl-tmp/checkpoints/edap_random_best.pt
 ```
 
 **Model download**: `setup.sh` downloads Qwen2.5-7B to `./models/qwen2.5-7b`. If you already have the model elsewhere, pass `--model_path /path/to/model` to `train.py` and `evaluate.py`.
 
 ### Training Notes
 
-- **Full-sequence loss**: Uses teacher-forcing over all answer tokens (not single-token), fixing the loss→0 overfitting problem
-- **Validation split**: Default 20% held out (`--val_split 0.2`); val loss logged per epoch for overfitting monitoring
-- **Early stopping**: Default patience=2 epochs (`--early_stop_patience 2`); saves best checkpoint only
-- **Label smoothing**: 0.1 default for regularization (`--label_smoothing 0.1`)
-- **Dropout**: 0.1 in EDAP attention (`--edap_dropout 0.1`)
-- **Auto dtype**: Detects bf16 support (A100) vs fp16 fallback (V100)
-- **Checkpointing**: Saved after every epoch to `--output_dir` (default `./checkpoints`; on AutoDL auto-redirects to `/root/autodl-tmp/checkpoints`)
+- **Teacher forcing over full answer sequences** (not single-token classification)
+- **Exposure bias mitigation**: Gaussian noise on EDAP sources during training (`--edap_noise 0.02`, default) to bridge the teacher-forcing → autoregressive gap; set `--edap_noise 0` to disable
+- **Target-entropy regularization** (`--lambda_entropy 0.05`): penalizes attention distributions that collapse to a single source or become uniform
+- **Gate L2 regularization** (`--lambda_gate_reg 0.01`): encourages per-token gates near 0.5, preventing EDAP from being bypassed (gate→0) or hard-replacing the backbone (gate→1)
+- **Stratified validation split**: 20% held out per `correct_source` type (`--val_split 0.2`); early stopping patience=2
+- **Label smoothing**: 0.1 default (`--label_smoothing 0.1`)
+- **`--freeze_lm_head`** (recommended): freezes the 545M lm_head and inserts a small trainable bottleneck, forcing EDAP to learn meaningful routing instead of letting the lm_head memorize dataset biases
+- Checkpoints saved to `--output_dir` (auto-redirects to `/root/autodl-tmp/checkpoints` on AutoDL)
 
 ### Evaluation Notes
 
-- All methods (EDAP, Greedy, CAD, DoLa) use **multi-token greedy generation** — not single-token argmax — for a fair comparison
-- Exact match (EM) is computed after normalizing whitespace and punctuation
-- Results broken down by `correct_source` (context vs memory) and saved as JSON
-- **Evaluates both NQ-Swap and ConFiQA** automatically; NQ-Swap is auto-downloaded from HuggingFace
-- Use `--max_samples N` to limit eval size (default 0 = all)
+- All methods use **multi-token greedy generation** for fair comparison
+- **DoLa** uses `early_exit=8` tuned for Qwen2.5-7B (28 layers), not the original LLaMA default of 13
+- Exact match (EM) and prefix-EM reported; prefix-EM catches models that know the answer but can't stop (common with CAD/DoLa)
+- Results broken down by `correct_source` (context / memory)
+- **Evaluates both NQ-Swap and ConFiQA** automatically; NQ-Swap auto-downloaded from HuggingFace
 - Checkpoint config (n_heads, n_blocks, dropout) auto-detected from saved state
 
 ## Requirements
@@ -100,16 +102,10 @@ python src/evaluate.py --checkpoint ./checkpoints/edap_best.pt --max_samples 500
 
 ### ConFiQA (training + eval)
 
-1. Download raw data from HuggingFace:
-   ```bash
-   huggingface-cli download miii/ConFiQA --local-dir ./ConFiQA
-   ```
-   (produces `ConFiQA/ConFiQA-QA.json`, `ConFiQA/ConFiQA-MR.json`, `ConFiQA/ConFiQA-MC.json`)
-2. Convert to unified training format:
-   ```bash
-   python scripts/convert_confiqa.py
-   ```
-   (produces `data/confiqa/confiqa_train.json`)
+1. Download raw data: `huggingface-cli download miii/ConFiQA --local-dir ./ConFiQA`
+2. Convert + decontaminate: `python scripts/convert_confiqa.py`
+   - Produces `data/confiqa/confiqa_train.json` and `data/confiqa/confiqa_test.json` (80/20 stratified split)
+   - Detects and masks answer leaks in counterfactual contexts (replaces leaked spans with `[MASK]`)
 
 ### NQ-Swap (eval only)
 
@@ -145,43 +141,27 @@ EDAP/
 
 ## Key Design Decisions
 
-- **Multi-plugin chain**: 4 plugins at block boundaries for incremental calibration
-- **Multi-head (H=8)**: dimension split across heads for nuanced attention
-- **Three LayerNorms**: Input (depth magnitude), Key (attention stability), Output (residual preservation)
-- **Zero-init W_O**: Plugin starts as identity mapping, learns to deviate only where needed
-- **Unfrozen lm_head**: Required for gradient pathway through frozen backbone
-- **Ablation**: `--shuffle_depth` flag randomizes source ordering to verify depth dimension matters (optional ablation experiment)
+- **Delta-mode K**: attention keys computed from incremental block differences (`s_i − s_{i−1}`), giving higher contrast than raw cumulated vectors. Learnable baseline for source 0 prevents magnitude asymmetry.
+- **Per-token gated mixing**: each token independently blends EDAP-fused output with original block output via a learned sigmoid gate (initialized at 0.5), preventing the plugin from overwriting non-conflict tokens.
+- **Progressive source count**: EDAP₀ sees 2 sources (emb + block₀), EDAP₆ sees 8 — shallow plugins make simple decisions, deep plugins have full trajectory visibility.
+- **Zero-init W_O**: plugin starts as identity mapping, learns to deviate only where needed.
+- **Shared K/V across plugins** (`--shared_kv`): reduces parameter count ~1/3.
+- **`--freeze_lm_head`**: inserts a trainable d→d bottleneck before the frozen lm_head, preventing the 545M classification head from memorizing dataset biases and forcing EDAP to learn meaningful routing.
+- **Exposure bias noise** (`--edap_noise`): Gaussian perturbation of EDAP sources during training, bridging the gap between teacher-forcing (GT hidden states) and autoregressive generation.
+- **Target-entropy regularization**: keeps cross-depth attention informative without collapsing to single-source or uniform routing.
+- **Ablations**: `--shuffle_depth` (randomize block order), `--no_delta`, `--no_gate`, `--no_flip_augmentation`.
 
-## Results (ConFiQA-trained EDAP, Qwen2.5-7B backbone)
+## Results
 
-Evaluation on 500 samples per dataset, multi-token greedy decoding.
+Run `python src/report.py --edap_ckpt <path> --edap_random_ckpt <path>` after training to generate a full comparison report with:
 
-### Overall
+- EM / Prefix-EM breakdown by method (EDAP, EDAP-random, Greedy, CAD, DoLa) and dataset (ConFiQA, NQ-Swap)
+- Per-source-type analysis (context vs. memory)
+- Cross-depth attention heatmaps (EDAP vs. EDAP-random)
+- Failure case analysis (EDAP-wrong / Greedy-right reversals)
+- Success criteria checklist (against `prototype-experiment.md`)
 
-| Method | ConFiQA EM | NQ-Swap EM | NQ-Swap P-EM |
-|--------|-----------|------------|-------------|
-| Greedy (no intervention) | 16.60% | 44.00% | 63.60% |
-| CAD | 3.60% | 7.40% | 64.80% |
-| DoLa | 5.40% | 7.80% | 23.20% |
-| **EDAP** | **58.20%** | 10.80% | 14.80% |
-
-> EM = strict exact match; P-EM = prefix match (output starts with correct answer — catches CAD/DoLa EOS suppression). NQ-Swap P-EM reveals CAD actually knows the answer 64.8% of the time but can't stop.
-
-### ConFiQA by source (EM)
-
-| Method | Context (n=245) | Memory (n=255) |
-|--------|:---:|:---:|
-| Greedy | 28.7% | 3.7% |
-| CAD | 7.0% | 0.0% |
-| DoLa | 9.7% | 0.8% |
-| **EDAP** | **77.1%** | **38.0%** |
-
-### Key Findings
-
-- **EDAP outperforms Greedy by +41.6pp on ConFiQA** (16.6% → 58.2%), with context-type answers reaching 77.1%
-- **EDAP does not transfer to NQ-Swap**: 10.8% EM vs Greedy's 44.0% — the learned routing is ConFiQA-specific, proving plugins capture dataset-level conflict patterns rather than a coarse heuristic
-- **CAD's EOS problem confirmed**: NQ-Swap P-EM is 64.8% but EM is only 7.4% — logit contrast suppresses the stop token, causing correct answers to be buried in continuation text
-- Greedy naturally follows NQ-Swap's swapped context (44.0%), but struggles with ConFiQA's missing-context scenarios (16.6%)
+Results are saved to `results/` as JSON + Markdown report + attention heatmap.
 
 ## License
 

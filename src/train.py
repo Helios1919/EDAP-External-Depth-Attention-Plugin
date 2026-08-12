@@ -62,10 +62,19 @@ parser.add_argument("--val_split", type=float, default=0.2,
                     help="Fraction of training data held out for validation")
 parser.add_argument("--early_stop_patience", type=int, default=2,
                     help="Stop if val loss doesn't improve for N epochs (0 = off)")
-parser.add_argument("--lambda_entropy", type=float, default=0.01,
-                    help="Entropy regularisation weight on cross-depth attention (0 = off)")
-parser.add_argument("--no_flip_augmentation", action="store_true",
-                    help="Disable flipped counterfactual augmentation (ablation)")
+parser.add_argument("--lambda_entropy", type=float, default=0.05,
+                    help="Target-entropy regularisation on cross-depth attention (0 = off). "
+                         "Penalises deviation from target entropy ln(min(N,3)), "
+                         "preventing both attention collapse (too low) and uniform routing (too high).")
+parser.add_argument("--lambda_gate_reg", type=float, default=0.01,
+                    help="Gate L2 regularisation toward 0.5: prevents gate from collapsing "
+                         "to 0 (bypass EDAP) or 1 (hard-replace backbone) (0 = off)")
+parser.add_argument("--flip_augmentation", action="store_true",
+                    help="Enable flipped counterfactual augmentation (opt-in)")
+parser.add_argument("--edap_noise", type=float, default=0.02,
+                    help="Gaussian noise std on EDAP sources during training; "
+                         "mitigates exposure bias from teacher forcing "
+                         "(0 = off; recommended 0.01-0.05)")
 parser.add_argument("--dataset_types", type=str, default=None,
                     help="Comma-separated types to keep, e.g. 'counterfactual,context_required'. "
                          "If not set, all types are used. Useful for two-phase training.")
@@ -165,21 +174,33 @@ print("Loading data...")
 train_dataset = ConFiQADataset(
     data_path=args.data_path, split="train",
     max_samples=100 if args.dry_run else None,
-    augment_counterfactual=not args.no_flip_augmentation,
+    augment_counterfactual=args.flip_augmentation,
     tokenizer=tokenizer, max_seq_length=args.max_seq_length, seed=42,
 )
 
-# ---- validation split ----
+# ---- validation split (stratified by correct_source) ----
 if args.val_split > 0:
-    n_val = int(len(train_dataset) * args.val_split)
-    n_train = len(train_dataset) - n_val
-    train_subset, val_subset = torch.utils.data.random_split(
-        train_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
-    )
+    from collections import defaultdict
+    # group indices by correct_source for stratified split
+    source_to_indices = defaultdict(list)
+    for i, s in enumerate(train_dataset.samples):
+        src = s.get("correct_source", "unknown")
+        source_to_indices[src].append(i)
+
+    train_indices, val_indices = [], []
+    rng = torch.Generator().manual_seed(42)
+    for src, indices in source_to_indices.items():
+        n_val_src = max(1, int(len(indices) * args.val_split))
+        perm = torch.randperm(len(indices), generator=rng).tolist()
+        val_indices.extend([indices[p] for p in perm[:n_val_src]])
+        train_indices.extend([indices[p] for p in perm[n_val_src:]])
+        print(f"  {src}: {len(indices) - n_val_src} train / {n_val_src} val")
+
+    train_subset = torch.utils.data.Subset(train_dataset, train_indices)
+    val_subset = torch.utils.data.Subset(train_dataset, val_indices)
     train_loader = create_dataloader(train_subset, batch_size=args.batch_size, shuffle=True)
     val_loader = create_dataloader(val_subset, batch_size=args.batch_size, shuffle=False)
-    print(f"Train: {n_train}  Val: {n_val}")
+    print(f"Train: {len(train_indices)}  Val: {len(val_indices)}")
 else:
     train_loader = create_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = None
@@ -241,32 +262,49 @@ for epoch in range(args.epochs):
             shuffle_depth=args.shuffle_depth,
             delta_mode=not args.no_delta,
             gate_mode=not args.no_gate,
+            edap_noise=args.edap_noise,
             collect_weights=True,
             lm_head_bottleneck=lm_head_bottleneck,
         )  # logits: [B, S, V]; all_weights: list of [B, S, H, N]
 
-        # ---- entropy regularisation ------------------------------------------
-        # Penalise uniform source attention → enforce decisive routing
+        # ---- entropy regularisation (target-based) -------------------------
+        # Penalise deviation from a target entropy, preventing both
+        # attention collapse (too low) and uniform routing (too high).
         if args.lambda_entropy > 0:
-            entropy_loss = 0.0
+            entropy_loss = torch.tensor(0.0, device=device)
             for w in all_weights:
-                # w: [B, S, H, N]  — compute over source dimension
-                ent = -(w * torch.log(w + 1e-8)).sum(dim=-1).mean()
-                entropy_loss = entropy_loss + ent
+                # w: [B, S, H, N]  — per-source entropy, averaged over B,S,H
+                ent = -(w * torch.log(w + 1e-8)).sum(dim=-1)  # [B, S, H]
+                N = w.size(-1)
+                target_H = math.log(min(N, 3))  # encourage focusing on ~3 sources
+                entropy_loss = entropy_loss + ((ent - target_H) ** 2).mean()
             entropy_loss = entropy_loss / len(all_weights)
         else:
-            entropy_loss = 0.0
+            entropy_loss = torch.tensor(0.0, device=device)
+
+        # ---- gate regularisation --------------------------------------------
+        # Penalise gate straying far from 0.5 → prevents EDAP from being
+        # bypassed entirely (gate≈0) or hard-replacing backbone (gate≈1).
+        if args.lambda_gate_reg > 0:
+            gate_reg = torch.tensor(0.0, device=device)
+            for g in all_gates:
+                gate_reg = gate_reg + ((g - 0.5) ** 2).mean()
+            gate_reg = gate_reg / len(all_gates)
+        else:
+            gate_reg = torch.tensor(0.0, device=device)
 
         # Shift: predict token[t] from hidden[t-1]
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
-        loss = F.cross_entropy(
+        ce_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
             label_smoothing=args.label_smoothing,
         )
-        loss = (loss + args.lambda_entropy * entropy_loss) / args.grad_accum
+        loss = (ce_loss
+                + args.lambda_entropy * entropy_loss
+                + args.lambda_gate_reg * gate_reg) / args.grad_accum
         loss.backward()
 
         if (step + 1) % args.grad_accum == 0:
@@ -293,7 +331,7 @@ for epoch in range(args.epochs):
                 attn_ents.append(ent)
             avg_attn_ent = sum(attn_ents) / len(attn_ents)
 
-            print(f"Epoch {epoch+1} step {global_step} | loss {avg_loss:.4f} lr {lr:.2e} | gate μ={gate_mean:.3f} σ={gate_std:.3f} | attn_H={avg_attn_ent:.3f}")
+            print(f"Epoch {epoch+1} step {global_step} | loss {avg_loss:.4f} lr {lr:.2e} | gate μ={gate_mean:.3f} σ={gate_std:.3f} | attn_H={avg_attn_ent:.3f} | ent={entropy_loss.item():.4f} gate_reg={gate_reg.item():.4f}")
             if args.wandb:
                 wandb.log({
                     "train/loss": avg_loss,
@@ -301,7 +339,9 @@ for epoch in range(args.epochs):
                     "train/gate_mean": gate_mean,
                     "train/gate_std": gate_std,
                     "train/attn_entropy": avg_attn_ent,
-                    "train/ce_loss": loss.item() * args.grad_accum - args.lambda_entropy * entropy_loss,
+                    "train/ce_loss": ce_loss.item(),
+                    "train/entropy_loss": entropy_loss.item(),
+                    "train/gate_reg": gate_reg.item(),
                 }, step=global_step)
 
         if args.dry_run and global_step >= 3:
@@ -357,9 +397,13 @@ for epoch in range(args.epochs):
                 patience_counter += 1
                 print(f"Val loss did not improve ({patience_counter}/{args.early_stop_patience})")
 
-        # ---- save checkpoint (only best model, no optimizer to save space) ----
-        is_best = (val_loss == best_val_loss)
-        if is_best and val_loader is not None:
+        # ---- save checkpoint ----
+        if val_loader is not None:
+            is_best = (val_loss == best_val_loss)
+        else:
+            # No validation split — save every epoch
+            is_best = True
+        if is_best:
             os.makedirs(args.output_dir, exist_ok=True)
             tag = "edap_random" if args.shuffle_depth else "edap"
             ckpt_path = Path(args.output_dir) / f"{tag}_best.pt"

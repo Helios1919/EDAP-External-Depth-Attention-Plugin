@@ -57,6 +57,7 @@ class EDAPPlugin(nn.Module):
         sources: list,
         shuffle_depth: bool = False,
         delta_mode: bool = False,
+        edap_noise: float = 0.0,
     ):
         """Run cross-depth attention.
 
@@ -64,12 +65,22 @@ class EDAPPlugin(nn.Module):
         shuffle_depth: if True, permute source order for control experiment.
         delta_mode: if True, build K from incremental deltas (high contrast);
                     V always uses cumulated sources.
+        edap_noise: if > 0 and in training mode, add scaled Gaussian noise
+                    to sources before MHA. Mitigates exposure bias from
+                    teacher-forcing (training sees GT hidden states, but
+                    inference sees generated-token hidden states).
 
         Returns (r_out, weights, gate):
             r_out:  [B, S, d_model] fused output via residual + delta.
             weights: [B, S, H, N] attention weights over sources.
             gate:   [B, S, 1] per-token mixing gate.
         """
+        # ---- exposure-bias noise (train only) -----------------------------
+        if edap_noise > 0 and self.training:
+            sources = [
+                s + torch.randn_like(s) * edap_noise
+                for s in sources
+            ]
         B, S, _ = sources[-1].shape
         N = len(sources)
 
@@ -163,6 +174,7 @@ def edap_forward(
     shuffle_depth: bool = False,
     delta_mode: bool = True,
     gate_mode: bool = True,
+    edap_noise: float = 0.0,
     collect_weights: bool = False,
     lm_head_bottleneck: Optional[nn.Module] = None,
 ):
@@ -248,20 +260,27 @@ def edap_forward(
         sources: List[torch.Tensor] = [emb] + fused_outputs + [block_out]
         fused, weights, gate = edap_plugins[blk_idx](
             sources, shuffle_depth=shuffle_depth, delta_mode=delta_mode,
+            edap_noise=edap_noise,
         )
         fused_outputs.append(fused)
         if collect_weights:
             all_weights.append(weights)
             all_gates.append(gate)
 
-        # 4. Gated mixing or hard replacement
-        if gate_mode and blk_idx < len(edap_plugins) - 1:
-            current = (gate * fused + (1 - gate) * block_out).to(current.dtype)
-        elif blk_idx < len(edap_plugins) - 1:
-            current = fused.to(current.dtype)
+        # 4. Gated mixing or hard replacement for intermediate blocks;
+        #    the last block's gate is applied below before lm_head.
+        if blk_idx < len(edap_plugins) - 1:
+            if gate_mode:
+                current = (gate * fused + (1 - gate) * block_out).to(current.dtype)
+            else:
+                current = fused.to(current.dtype)
 
     # ---- lm_head -----------------------------------------------------------
     hidden = fused_outputs[-1]
+    if gate_mode:
+        # Apply the last EDAP plugin's gate to the final fused output.
+        # Previously the last gate was computed but never used, wasting its params.
+        hidden = (gate * hidden + (1 - gate) * block_out).to(hidden.dtype)
     if lm_head_bottleneck is not None:
         hidden = lm_head_bottleneck(hidden.to(compute_dtype))
     logits = model.lm_head(hidden)

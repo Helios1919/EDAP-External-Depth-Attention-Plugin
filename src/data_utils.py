@@ -22,7 +22,7 @@ class ConFiQADataset(Dataset):
         data_path: Optional[str] = None,
         split: str = "train",
         max_samples: Optional[int] = None,
-        augment_counterfactual: bool = True,
+        augment_counterfactual: bool = False,
         tokenizer=None,
         max_seq_length: int = 1024,
         seed: int = 42,

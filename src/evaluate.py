@@ -32,8 +32,8 @@ def parse_args():
     p.add_argument("--baseline", default=None, choices=["greedy", "cad", "dola"])
     p.add_argument("--cad_alpha", type=float, default=1.0,
                     help="Contrast strength for CAD baseline (default 1.0)")
-    p.add_argument("--dola_early_exit", type=int, default=13,
-                    help="Early exit layer for DoLa baseline (default 13)")
+    p.add_argument("--dola_early_exit", type=int, default=8,
+                    help="Early exit layer for DoLa baseline (default 8, tuned for Qwen2.5-7B 28L)")
     p.add_argument("--temperature", type=float, default=0.0,
                     help="Sampling temperature; 0 = greedy, >0 = multinomial sampling")
     return p.parse_args()
@@ -79,8 +79,9 @@ def load_eval_data(path, max_samples=0):
 
 def normalize_answer(text):
     text = text.strip().lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    text = re.sub(r"\s+", " ", text)
+    # Replace punctuation with space (preserves decimal points in numbers: 3.14 → 3 14)
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
@@ -167,7 +168,7 @@ def run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=False,
         # Attention stats collection not yet implemented for generation mode;
         # fall back to returning results only.
         pass
-    return results
+    return results, None
 
 
 def _build_attn_summary(attn_stats, n_plugins):
@@ -246,15 +247,19 @@ def run_greedy(samples, model, tokenizer, temperature=0.0):
 
 
 def _generate_cad_answer(model, tokenizer, prompt_ctx, prompt_no_ctx, max_new=32, alpha=1.0):
-    """Greedy decode with CAD logit contrasting at each step."""
+    """Greedy decode with CAD logit contrasting at each step (uses KV-cache)."""
     input_ids_ctx = tokenizer(prompt_ctx, return_tensors="pt")["input_ids"].to(model.device)
     input_ids_no = tokenizer(prompt_no_ctx, return_tensors="pt")["input_ids"].to(model.device)
     generated = []
+    past_ctx, past_no = None, None
 
     for _ in range(max_new):
+        current_ctx = input_ids_ctx if past_ctx is None else input_ids_ctx[:, -1:]
+        current_no = input_ids_no if past_no is None else input_ids_no[:, -1:]
         with torch.no_grad():
-            out_ctx = model(input_ids_ctx)
-            out_no = model(input_ids_no)
+            out_ctx = model(current_ctx, past_key_values=past_ctx, use_cache=True)
+            out_no = model(current_no, past_key_values=past_no, use_cache=True)
+            past_ctx, past_no = out_ctx.past_key_values, out_no.past_key_values
             logits = (1 + alpha) * out_ctx.logits[0, -1, :] - alpha * out_no.logits[0, -1, :]
         next_id = torch.argmax(logits, dim=-1, keepdim=True)
         generated.append(next_id.item())
@@ -285,8 +290,12 @@ def run_cad(samples, model, tokenizer, alpha=1.0):
     return results
 
 
-def run_dola(samples, model, tokenizer, early_exit=13):
-    """DoLa (Chuang et al., ICLR 2024) — generation with layer contrasting."""
+def run_dola(samples, model, tokenizer, early_exit=8):
+    """DoLa (Chuang et al., ICLR 2024) — generation with layer contrasting.
+
+    Default early_exit=8 is tuned for Qwen2.5-7B (28 layers).
+    Original DoLa used early_exit=13 for LLaMA-7B (32 layers).
+    """
 
     early_layer = model.model.layers[early_exit]
 
@@ -296,45 +305,46 @@ def run_dola(samples, model, tokenizer, early_exit=13):
     _early_hook.state = None
     handle = early_layer.register_forward_hook(_early_hook)
 
-    results = []
-    for s in tqdm(samples, desc="DoLa"):
-        prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
-        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
-        generated = []
+    try:
+        results = []
+        for s in tqdm(samples, desc="DoLa"):
+            prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
+            input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
+            generated = []
 
-        for _ in range(32):
-            _early_hook.state = None
-            with torch.no_grad():
-                out = model(input_ids)
-                logits_final = out.logits[0, -1, :]
+            for _ in range(32):
+                _early_hook.state = None
+                with torch.no_grad():
+                    out = model(input_ids)
+                    logits_final = out.logits[0, -1, :]
 
-            if _early_hook.state is not None:
-                early_hidden = _early_hook.state[0, -1, :].to(COMPUTE_DTYPE)
-                early_hidden = model.model.norm(early_hidden)
-                logits_early = model.lm_head(early_hidden.to(COMPUTE_DTYPE)).float()
-                logits = logits_final.float() - logits_early
-            else:
-                logits = logits_final
+                if _early_hook.state is not None:
+                    early_hidden = _early_hook.state[0, -1, :].to(COMPUTE_DTYPE)
+                    early_hidden = model.model.norm(early_hidden)
+                    logits_early = model.lm_head(early_hidden.to(COMPUTE_DTYPE)).float()
+                    logits = logits_final.float() - logits_early
+                else:
+                    logits = logits_final
 
-            next_id = torch.argmax(logits, dim=-1, keepdim=True)
-            generated.append(next_id.item())
-            if next_id.item() == tokenizer.eos_token_id:
-                break
-            input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
+                next_id = torch.argmax(logits, dim=-1, keepdim=True)
+                generated.append(next_id.item())
+                if next_id.item() == tokenizer.eos_token_id:
+                    break
+                input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
 
-        pred = tokenizer.decode(generated, skip_special_tokens=True)
+            pred = tokenizer.decode(generated, skip_special_tokens=True)
 
-        gt = s.get("correct_answer", "")
-        pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
-        results.append({
-            "pred": pred_norm,
-            "gt": gt_norm,
-            "correct_source": s.get("correct_source", "unknown"),
-            "em": em,
-            "em_prefix": em_prefix,
-        })
-
-    handle.remove()
+            gt = s.get("correct_answer", "")
+            pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
+            results.append({
+                "pred": pred_norm,
+                "gt": gt_norm,
+                "correct_source": s.get("correct_source", "unknown"),
+                "em": em,
+                "em_prefix": em_prefix,
+            })
+    finally:
+        handle.remove()
     return results
 
 
@@ -366,8 +376,8 @@ def summarize(results, method, ds_name, output_dir):
     # Context-Faithfulness & Memory-Faithfulness metrics
     ctx_faith_em = em_by_source.get("context", {}).get("em", 0.0)
     ctx_faith_n = em_by_source.get("context", {}).get("n", 0)
-    mem_faith_em = em_by_source.get("param", {}).get("em", 0.0)
-    mem_faith_n = em_by_source.get("param", {}).get("n", 0)
+    mem_faith_em = em_by_source.get("memory", {}).get("em", 0.0)
+    mem_faith_n = em_by_source.get("memory", {}).get("n", 0)
     print(f"  Context-Faithfulness: {ctx_faith_em:.2f}% ({ctx_faith_n} samples)")
     print(f"  Memory-Faithfulness:  {mem_faith_em:.2f}% ({mem_faith_n} samples)")
 
@@ -466,7 +476,7 @@ if __name__ == "__main__":
             method = args.baseline
         else:
             shuffle = args.shuffle_depth
-            res = run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=shuffle,
+            res, _ = run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=shuffle,
                            temperature=args.temperature,
                            lm_head_bottleneck=lm_head_bottleneck)
             method = "edap_random" if shuffle else "edap"
