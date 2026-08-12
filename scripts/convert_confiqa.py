@@ -10,8 +10,11 @@ import random
 from pathlib import Path
 
 SRC_DIR = Path(__file__).parent.parent / "ConFiQA"
-DST = Path(__file__).parent.parent / "data" / "confiqa" / "confiqa_train.json"
+OUT_DIR = Path(__file__).parent.parent / "data" / "confiqa"
+TRAIN_DST = OUT_DIR / "confiqa_train.json"
+TEST_DST = OUT_DIR / "confiqa_test.json"
 SEED = 42
+TEST_RATIO = 0.2  # 80/20 train/test split
 
 files = ["ConFiQA-QA.json", "ConFiQA-MR.json", "ConFiQA-MC.json"]
 
@@ -46,14 +49,29 @@ for fname in files:
 random.seed(SEED)
 random.shuffle(samples)
 
-DST.parent.mkdir(parents=True, exist_ok=True)
-with open(DST, "w", encoding="utf-8") as f:
-    json.dump(samples, f, ensure_ascii=False, indent=2)
+# 按类型分层切分 train/test
+cc_samples = [s for s in samples if s["type"] == "counterfactual"]
+cr_samples = [s for s in samples if s["type"] == "context_required"]
+ci_samples = [s for s in samples if s["type"] == "context_irrelevant"]
+
+train_samples, test_samples = [], []
+for group in [cc_samples, cr_samples, ci_samples]:
+    n_test = max(1, int(len(group) * TEST_RATIO))
+    test_samples.extend(group[:n_test])
+    train_samples.extend(group[n_test:])
+
+random.shuffle(train_samples)
+random.shuffle(test_samples)
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+with open(TRAIN_DST, "w", encoding="utf-8") as f:
+    json.dump(train_samples, f, ensure_ascii=False, indent=2)
+with open(TEST_DST, "w", encoding="utf-8") as f:
+    json.dump(test_samples, f, ensure_ascii=False, indent=2)
 
 # 统计
 from collections import Counter
-cnt = Counter(s["type"] for s in samples)
-cfg = Counter(s["config"] for s in samples)
-print(f"✅ 写入 {DST}  →  {len(samples)} 条样本")
-print(f"   type 分布: {dict(cnt)}")
-print(f"   config 分布: {dict(cfg)}")
+for name, subset in [("train", train_samples), ("test", test_samples)]:
+    cnt = Counter(s["type"] for s in subset)
+    cfg = Counter(s["config"] for s in subset)
+    print(f"✅ {name}: {len(subset)} 条  →  type {dict(cnt)}  config {dict(cfg)}")

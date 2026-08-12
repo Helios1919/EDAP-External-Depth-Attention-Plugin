@@ -24,7 +24,7 @@ def parse_args():
     p.add_argument("--model_name", default="Qwen/Qwen2.5-7B")
     p.add_argument("--checkpoint", default=None)
     p.add_argument("--shuffle_depth", action="store_true")
-    p.add_argument("--data_path", default="./data/confiqa/confiqa_train.json")
+    p.add_argument("--data_path", default="./data/confiqa/confiqa_test.json")
     p.add_argument("--nq_swap_path", default="./data/nqswap/nqswap_dev.json")
     p.add_argument("--output_dir", default="./results")
     p.add_argument("--max_samples", type=int, default=0)
