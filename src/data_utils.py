@@ -26,6 +26,7 @@ class ConFiQADataset(Dataset):
         tokenizer=None,
         max_seq_length: int = 1024,
         seed: int = 42,
+        dataset_types: Optional[list] = None,
     ):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
@@ -50,6 +51,18 @@ class ConFiQADataset(Dataset):
         cr = [s for s in raw if s.get("type") == "context_required"]
         ci = [s for s in raw if s.get("type") == "context_irrelevant"]
         cc = [s for s in raw if s.get("type") == "counterfactual"]
+
+        # Optional type filter (two-phase training: phase 1 → only counterfactual)
+        if dataset_types is not None:
+            filter_before = len(cc) + len(cr) + len(ci)
+            keep = set(t.strip().lower() for t in dataset_types)
+            if "counterfactual" not in keep:
+                cc = []
+            if "context_required" not in keep:
+                cr = []
+            if "context_irrelevant" not in keep:
+                ci = []
+            print(f"Type filter {dataset_types}: kept {len(cc)+len(cr)+len(ci)} of {filter_before}")
 
         # Use all available data (no hardcoded caps)
         self.samples.extend(cc)

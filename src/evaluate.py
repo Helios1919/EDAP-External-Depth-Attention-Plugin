@@ -119,7 +119,8 @@ def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, te
         # EDAP-interleaved forward: returns [1, S, V]
         logits = edap_forward(
             model, input_ids, None, edap_plugins,
-            BLOCK_EXITS, COMPUTE_DTYPE, shuffle_depth=False,
+            BLOCK_EXITS, COMPUTE_DTYPE,
+            shuffle_depth=False, delta_mode=True, gate_mode=True,
         )
         next_logits = logits[0, -1, :]
 

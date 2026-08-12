@@ -23,13 +23,20 @@ parser.add_argument("--data_path", default="./data/confiqa/confiqa_train.json")
 parser.add_argument("--output_dir", default="./checkpoints",
                     help="Default auto-uses /root/autodl-tmp/ if available")
 parser.add_argument("--log_dir", default="./logs")
-parser.add_argument("--edap_blocks", type=int, default=4)
+parser.add_argument("--edap_blocks", type=int, default=7,
+                    help="Number of EDAP plugins (= block boundaries); 7 → every 4 layers")
 parser.add_argument("--edap_heads", type=int, default=8)
 parser.add_argument("--edap_dropout", type=float, default=0.1,
                     help="Dropout rate in EDAP plugins")
+parser.add_argument("--shared_kv", action="store_true",
+                    help="Share W_K/W_V across plugins (reduces params ~1/3)")
 parser.add_argument("--block_layers", type=str, default=None,
-                    help="Comma-separated block boundary layer indices, e.g. '6,13,20,27'. "
-                         "If not set, auto-computed evenly from 28 layers given --edap_blocks.")
+                    help="Comma-separated block boundary layer indices, e.g. '3,7,11,15,19,23,27'. "
+                         "If not set, auto-computed evenly given --edap_blocks.")
+parser.add_argument("--no_delta", action="store_true",
+                    help="Disable delta attention (use cumulated K instead)")
+parser.add_argument("--no_gate", action="store_true",
+                    help="Disable gated mixing (hard-replace residual)")
 parser.add_argument("--epochs", type=int, default=5)
 parser.add_argument("--batch_size", type=int, default=8,
                     help="A100 default 8; reduce to 2 for V100-32GB")
@@ -50,8 +57,13 @@ parser.add_argument("--val_split", type=float, default=0.2,
                     help="Fraction of training data held out for validation")
 parser.add_argument("--early_stop_patience", type=int, default=2,
                     help="Stop if val loss doesn't improve for N epochs (0 = off)")
+parser.add_argument("--lambda_entropy", type=float, default=0.01,
+                    help="Entropy regularisation weight on cross-depth attention (0 = off)")
 parser.add_argument("--no_flip_augmentation", action="store_true",
                     help="Disable flipped counterfactual augmentation (ablation)")
+parser.add_argument("--dataset_types", type=str, default=None,
+                    help="Comma-separated types to keep, e.g. 'counterfactual,context_required'. "
+                         "If not set, all types are used. Useful for two-phase training.")
 parser.add_argument("--shuffle_depth", action="store_true")
 parser.add_argument("--dry_run", action="store_true")
 parser.add_argument("--wandb", action="store_true", default=False)
@@ -194,11 +206,28 @@ for epoch in range(args.epochs):
         attn_mask = batch["attention_mask"].to(device)
 
         # EDAP-interleaved forward: backbone runs in no_grad, EDAP
-        # fuses at each block boundary and injects back into residual stream
-        logits = edap_forward(
+        # fuses at each block boundary and injects gated residual
+        logits, all_weights = edap_forward(
             model, input_ids, attn_mask, edap_plugins,
-            BLOCK_EXITS, COMPUTE_DTYPE, shuffle_depth=args.shuffle_depth,
-        )  # [B, S, V]
+            BLOCK_EXITS, COMPUTE_DTYPE,
+            shuffle_depth=args.shuffle_depth,
+            delta_mode=not args.no_delta,
+            gate_mode=not args.no_gate,
+            collect_weights=True,
+        )  # logits: [B, S, V]; all_weights: list of [B, S, H, N]
+
+        # ---- entropy regularisation ------------------------------------------
+        # Penalise uniform source attention → enforce decisive routing
+        if args.lambda_entropy > 0:
+            entropy_loss = 0.0
+            for w in all_weights:
+                # w: [B, S, H, N]  — compute over source dimension
+                ent = -(w * torch.log(w + 1e-8)).sum(dim=-1).mean()
+                entropy_loss = entropy_loss + ent
+            entropy_loss = entropy_loss / len(all_weights)
+        else:
+            entropy_loss = 0.0
+
         # Shift: predict token[t] from hidden[t-1]
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
@@ -208,7 +237,7 @@ for epoch in range(args.epochs):
             ignore_index=-100,
             label_smoothing=args.label_smoothing,
         )
-        loss = loss / args.grad_accum
+        loss = (loss + args.lambda_entropy * entropy_loss) / args.grad_accum
         loss.backward()
 
         if (step + 1) % args.grad_accum == 0:
@@ -247,10 +276,13 @@ for epoch in range(args.epochs):
                 labels = batch["labels"].to(device)
                 attn_mask = batch["attention_mask"].to(device)
 
-                logits = edap_forward(
+                logits, _ = edap_forward(
                     model, input_ids, attn_mask, edap_plugins,
                     BLOCK_EXITS, COMPUTE_DTYPE, shuffle_depth=args.shuffle_depth,
-                )  # [B, S, V] — edap_forward uses no_grad internally for backbone
+                    delta_mode=not args.no_delta,
+                    gate_mode=not args.no_gate,
+                    collect_weights=True,
+                )  # [B, S, V] — backbone inside no_grad; weights discarded in val
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_labels = labels[:, 1:].contiguous()
                 loss = F.cross_entropy(
