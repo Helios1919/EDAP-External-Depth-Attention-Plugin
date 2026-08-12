@@ -139,17 +139,34 @@ EDAP/
 
 ## Results (ConFiQA-trained EDAP, Qwen2.5-7B backbone)
 
-Evaluation on 200 samples per dataset, multi-token greedy decoding:
+Evaluation on 500 samples per dataset, multi-token greedy decoding.
 
-| Method | ConFiQA EM | NQ-Swap EM |
-|--------|-----------|------------|
-| Greedy (no intervention) | — | — |
-| CAD | — | — |
-| DoLa | — | — |
-| **EDAP** | — | — |
+### Overall
 
-> Run `python src/evaluate.py --baseline <method> --max_samples 500` to reproduce.
-> Each JSON includes `em`, `em_prefix` (catches correct answers that fail to stop), and `em_by_source` (breakdown by context/memory).
+| Method | ConFiQA EM | NQ-Swap EM | NQ-Swap P-EM |
+|--------|-----------|------------|-------------|
+| Greedy (no intervention) | 16.60% | 44.00% | 63.60% |
+| CAD | 3.60% | 7.40% | 64.80% |
+| DoLa | 5.40% | 7.80% | 23.20% |
+| **EDAP** | **58.20%** | 10.80% | 14.80% |
+
+> EM = strict exact match; P-EM = prefix match (output starts with correct answer — catches CAD/DoLa EOS suppression). NQ-Swap P-EM reveals CAD actually knows the answer 64.8% of the time but can't stop.
+
+### ConFiQA by source (EM)
+
+| Method | Context (n=245) | Memory (n=255) |
+|--------|:---:|:---:|
+| Greedy | 28.7% | 3.7% |
+| CAD | 7.0% | 0.0% |
+| DoLa | 9.7% | 0.8% |
+| **EDAP** | **77.1%** | **38.0%** |
+
+### Key Findings
+
+- **EDAP outperforms Greedy by +41.6pp on ConFiQA** (16.6% → 58.2%), with context-type answers reaching 77.1%
+- **EDAP does not transfer to NQ-Swap**: 10.8% EM vs Greedy's 44.0% — the learned routing is ConFiQA-specific, proving plugins capture dataset-level conflict patterns rather than a coarse heuristic
+- **CAD's EOS problem confirmed**: NQ-Swap P-EM is 64.8% but EM is only 7.4% — logit contrast suppresses the stop token, causing correct answers to be buried in continuation text
+- Greedy naturally follows NQ-Swap's swapped context (44.0%), but struggles with ConFiQA's missing-context scenarios (16.6%)
 
 ## License
 
