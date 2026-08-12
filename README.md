@@ -27,7 +27,7 @@ Each EDAP plugin: 8-head cross-depth attention with 3× LayerNorm (input, key, o
 ## Quick Start
 
 ```bash
-# 1. Setup environment
+# 1. Setup environment (conda env + model + raw data)
 bash scripts/setup.sh
 conda activate edap
 
@@ -38,8 +38,7 @@ python scripts/convert_confiqa.py
 python src/train.py --dry_run
 
 # 4. Full training (A100 defaults: batch=8, grad_accum=2)
-python src/train.py                      # EDAP
-python src/train.py --shuffle_depth      # EDAP-random (control)
+python src/train.py
 
 #   V100 fallback:
 #   python src/train.py --batch_size 2 --grad_accum 8
@@ -47,20 +46,14 @@ python src/train.py --shuffle_depth      # EDAP-random (control)
 #   Skip validation split (train on all data):
 #   python src/train.py --val_split 0
 
-# 5. Evaluate baselines (runs on both NQ-Swap & ConFiQA, 200 samples each)
-python src/evaluate.py --baseline greedy  --max_samples 200
-python src/evaluate.py --baseline cad     --max_samples 200
-python src/evaluate.py --baseline dola    --max_samples 200
-
-# 6. Evaluate trained EDAP (auto-detects checkpoint config: n_heads, n_blocks, dropout)
-python src/evaluate.py --checkpoint ./checkpoints/edap_best.pt --max_samples 200
-
-# 7. Generate full comparison report (optional, requires both checkpoints)
-python src/report.py \
-    --edap_ckpt checkpoints/edap_best.pt \
-    --edap_random_ckpt checkpoints/edap_random_best.pt \
-    --resume
+# 5. Evaluate all methods (runs on both NQ-Swap & ConFiQA, 500 samples each)
+python src/evaluate.py --baseline greedy  --max_samples 500
+python src/evaluate.py --baseline cad     --max_samples 500
+python src/evaluate.py --baseline dola    --max_samples 500
+python src/evaluate.py --checkpoint ./checkpoints/edap_best.pt --max_samples 500
 ```
+
+**Model download**: `setup.sh` downloads Qwen2.5-7B to `./models/qwen2.5-7b`. If you already have the model elsewhere, pass `--model_path /path/to/model` to `train.py` and `evaluate.py`.
 
 ### Training Notes
 
@@ -90,8 +83,24 @@ python src/report.py \
 
 ## Data
 
-- **ConFiQA**: converts official ConFiQA QA/MR/MC splits into unified training format. Official data goes in `ConFiQA/`; run `python scripts/convert_confiqa.py` to produce `data/confiqa/confiqa_train.json`
-- **NQ-Swap**: auto-downloaded from HuggingFace (`pminervini/NQ-Swap`) for evaluation
+### ConFiQA (training + eval)
+
+1. Download raw data from HuggingFace:
+   ```bash
+   huggingface-cli download miii/ConFiQA --local-dir ./ConFiQA
+   ```
+   (produces `ConFiQA/ConFiQA-QA.json`, `ConFiQA/ConFiQA-MR.json`, `ConFiQA/ConFiQA-MC.json`)
+2. Convert to unified training format:
+   ```bash
+   python scripts/convert_confiqa.py
+   ```
+   (produces `data/confiqa/confiqa_train.json`)
+
+### NQ-Swap (eval only)
+
+Auto-downloaded from HuggingFace (`pminervini/NQ-Swap`) on first evaluation run. Cached at `data/nqswap/nqswap_dev.json`.
+
+> **Network note**: If HuggingFace is inaccessible (e.g. mainland China), set `export HF_ENDPOINT=https://hf-mirror.com` before running downloads.
 
 ## Project Structure
 
@@ -118,7 +127,6 @@ EDAP/
 | Greedy | No intervention | — |
 | CAD | Output logit contrast | Shi et al., 2023 |
 | DoLa | Internal layer contrast (ICLR) | Chuang et al., 2024 |
-| EDAP-random | Cross-depth (shuffled control) | This work |
 
 ## Key Design Decisions
 
@@ -127,7 +135,7 @@ EDAP/
 - **Three LayerNorms**: Input (depth magnitude), Key (attention stability), Output (residual preservation)
 - **Zero-init W_O**: Plugin starts as identity mapping, learns to deviate only where needed
 - **Unfrozen lm_head**: Required for gradient pathway through frozen backbone
-- **EDAP-random control**: Same architecture with shuffled depth order — proves depth dimension matters
+- **Ablation**: `--shuffle_depth` flag randomizes source ordering to verify depth dimension matters (optional ablation experiment)
 
 ## Results (ConFiQA-trained EDAP, Qwen2.5-7B backbone)
 
@@ -135,15 +143,13 @@ Evaluation on 200 samples per dataset, multi-token greedy decoding:
 
 | Method | ConFiQA EM | NQ-Swap EM |
 |--------|-----------|------------|
-| Greedy (no intervention) | 17.00% | **50.50%** |
-| CAD | 3.50% | 10.50% |
-| DoLa | 6.00% | 7.50% |
-| **EDAP** | **58.00%** | 10.50% |
+| Greedy (no intervention) | — | — |
+| CAD | — | — |
+| DoLa | — | — |
+| **EDAP** | — | — |
 
-Key findings:
-- EDAP improves ConFiQA by **+41pp** over Greedy, with context-type EM reaching 80%
-- EDAP does not transfer to NQ-Swap — the learned routing is ConFiQA-specific, proving the plugins capture dataset-level conflict patterns rather than a coarse "trust context" heuristic
-- Greedy naturally follows NQ-Swap's swapped context (50.5%), but struggles with ConFiQA's missing-context scenarios (17%)
+> Run `python src/evaluate.py --baseline <method> --max_samples 500` to reproduce.
+> Each JSON includes `em`, `em_prefix` (catches correct answers that fail to stop), and `em_by_source` (breakdown by context/memory).
 
 ## License
 

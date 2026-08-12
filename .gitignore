@@ -12,6 +12,8 @@ results/
 # Data (large files; regenerate with convert_confiqa.py)
 data
 data/
+ConFiQA/
+ConFiQA
 
 # Python
 __pycache__/

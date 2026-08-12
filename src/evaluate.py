@@ -77,6 +77,19 @@ def normalize_answer(text):
     return text
 
 
+def compute_metrics(pred_text, gt_text):
+    """Compute both full EM and prefix EM.
+
+    Prefix EM catches cases where the model outputs the correct answer
+    but fails to stop (common with CAD/DoLa logit contrast suppressing EOS).
+    """
+    pred = normalize_answer(pred_text)
+    gt = normalize_answer(gt_text)
+    em = int(pred == gt)
+    em_prefix = int(pred.startswith(gt) and len(gt) > 0)
+    return pred, gt, em, em_prefix
+
+
 # ---------------------------------------------------------------
 # evaluation runners
 
@@ -134,12 +147,13 @@ def run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=False,
         pred_text = _generate_edap_answer(model, tokenizer, edap_plugins, prompt)
 
         gt = s.get("correct_answer", "")
-        em = int(normalize_answer(pred_text) == normalize_answer(gt))
+        pred_norm, gt_norm, em, em_prefix = compute_metrics(pred_text, gt)
         results.append({
-            "pred": normalize_answer(pred_text),
-            "gt": normalize_answer(gt),
+            "pred": pred_norm,
+            "gt": gt_norm,
             "correct_source": s.get("correct_source", "unknown"),
             "em": em,
+            "em_prefix": em_prefix,
         })
 
     if return_attn:
@@ -211,11 +225,13 @@ def run_greedy(samples, model, tokenizer):
         prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
         pred = _generate_greedy(model, tokenizer, prompt)
         gt = s.get("correct_answer", "")
+        pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
         results.append({
-            "pred": normalize_answer(pred),
-            "gt": normalize_answer(gt),
+            "pred": pred_norm,
+            "gt": gt_norm,
             "correct_source": s.get("correct_source", "unknown"),
-            "em": int(normalize_answer(pred) == normalize_answer(gt)),
+            "em": em,
+            "em_prefix": em_prefix,
         })
     return results
 
@@ -249,11 +265,13 @@ def run_cad(samples, model, tokenizer, alpha=1.0):
         prompt_no_ctx = f"Question: {s['question']}\n\nAnswer:"
         pred = _generate_cad_answer(model, tokenizer, prompt_ctx, prompt_no_ctx, alpha=alpha)
         gt = s.get("correct_answer", "")
+        pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
         results.append({
-            "pred": normalize_answer(pred),
-            "gt": normalize_answer(gt),
+            "pred": pred_norm,
+            "gt": gt_norm,
             "correct_source": s.get("correct_source", "unknown"),
-            "em": int(normalize_answer(pred) == normalize_answer(gt)),
+            "em": em,
+            "em_prefix": em_prefix,
         })
     return results
 
@@ -298,11 +316,13 @@ def run_dola(samples, model, tokenizer, early_exit=13):
         pred = tokenizer.decode(generated, skip_special_tokens=True)
 
         gt = s.get("correct_answer", "")
+        pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
         results.append({
-            "pred": normalize_answer(pred),
-            "gt": normalize_answer(gt),
+            "pred": pred_norm,
+            "gt": gt_norm,
             "correct_source": s.get("correct_source", "unknown"),
-            "em": int(normalize_answer(pred) == normalize_answer(gt)),
+            "em": em,
+            "em_prefix": em_prefix,
         })
 
     handle.remove()
@@ -313,22 +333,35 @@ def summarize(results, method, ds_name, output_dir):
     if not results:
         return
     em = sum(r["em"] for r in results) / len(results) * 100
-    print(f"\n{method} on {ds_name}: EM = {em:.2f}%")
+    em_prefix = sum(r.get("em_prefix", 0) for r in results) / len(results) * 100
+    print(f"\n{method} on {ds_name}: EM = {em:.2f}% | Prefix-EM = {em_prefix:.2f}%")
 
     by_source = {}
+    by_source_prefix = {}
     for r in results:
         src = r["correct_source"]
-        if src not in by_source:
-            by_source[src] = []
-        by_source[src].append(r["em"])
-    for src, ems in sorted(by_source.items()):
-        print(f"  {src}: EM = {sum(ems)/len(ems)*100:.2f}% ({len(ems)} samples)")
+        by_source.setdefault(src, []).append(r["em"])
+        by_source_prefix.setdefault(src, []).append(r.get("em_prefix", 0))
+
+    em_by_source = {}
+    for src in sorted(by_source):
+        src_em = sum(by_source[src]) / len(by_source[src]) * 100
+        src_em_prefix = sum(by_source_prefix[src]) / len(by_source_prefix[src]) * 100
+        em_by_source[src] = {
+            "em": round(src_em, 2),
+            "em_prefix": round(src_em_prefix, 2),
+            "n": len(by_source[src]),
+        }
+        print(f"  {src}: EM = {src_em:.2f}% | Prefix-EM = {src_em_prefix:.2f}% ({len(by_source[src])} samples)")
 
     out_path = Path(output_dir) / f"{ds_name}_{method}.json"
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump({
             "method": method, "dataset": ds_name,
-            "em": em, "n_samples": len(results), "results": results,
+            "em": em, "em_prefix": em_prefix,
+            "n_samples": len(results),
+            "em_by_source": em_by_source,
+            "results": results,
         }, f, indent=2, ensure_ascii=False)
     print(f"Saved -> {out_path}")
 

@@ -39,7 +39,8 @@ python -c "import transformers; print(f'Transformers {transformers.__version__}'
 if [ "$MINIMAL" = true ]; then
     echo "Minimal setup done. Download model/data manually:"
     echo "  huggingface-cli download Qwen/Qwen2.5-7B --local-dir ./models/qwen2.5-7b"
-    echo "  huggingface-cli download miii/ConFiQA --local-dir ./data/confiqa"
+    echo "  huggingface-cli download miii/ConFiQA --local-dir ./ConFiQA"
+    echo "  python scripts/convert_confiqa.py"
     exit 0
 fi
 
@@ -48,21 +49,23 @@ mkdir -p ./models/qwen2.5-7b
 if [ -f "./models/qwen2.5-7b/config.json" ]; then
     echo "Model already exists, skipping."
 else
+    echo "Downloading Qwen2.5-7B (this may take a while)..."
     huggingface-cli download Qwen/Qwen2.5-7B --local-dir ./models/qwen2.5-7b
 fi
 
-# data
-mkdir -p ./data
-if [ -d "./data/confiqa" ] && [ "$(ls -A ./data/confiqa 2>/dev/null)" ]; then
-    echo "Data already exists, skipping."
+# data — ConFiQA raw files (3 JSONs from miii/ConFiQA on HF)
+mkdir -p ./ConFiQA
+if [ -f "./ConFiQA/ConFiQA-QA.json" ]; then
+    echo "ConFiQA raw data already exists, skipping."
 else
-    huggingface-cli download miii/ConFiQA --local-dir ./data/confiqa
+    echo "Downloading ConFiQA raw data..."
+    huggingface-cli download miii/ConFiQA --local-dir ./ConFiQA
 fi
 
 echo ""
 echo "Setup complete."
 echo "  conda activate edap"
-echo "  python src/train.py --dry_run       # quick test"
-echo "  python src/train.py                 # full training"
-echo "  python src/train.py --shuffle_depth # control experiment"
-echo "  python src/evaluate.py --baseline greedy"
+echo "  python scripts/convert_confiqa.py    # convert raw data → training format"
+echo "  python src/train.py --dry_run        # quick test"
+echo "  python src/train.py                  # full training"
+echo "  python src/evaluate.py --baseline greedy --max_samples 500"
