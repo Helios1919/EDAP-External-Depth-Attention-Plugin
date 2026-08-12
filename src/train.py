@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb
 
-from edap_plugin import create_edap_plugins
+from edap_plugin import create_edap_plugins, edap_forward
 from data_utils import ConFiQADataset, create_dataloader
 
 
@@ -100,9 +100,8 @@ trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
 print(f"Trainable / total: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
-# -- hooks: grab hidden states at block boundaries -------------------
+# -- resolve block boundaries -----------------------------------------
 
-# Resolve block exits from CLI or auto-compute from 28 layers
 n_total_layers = len(model.model.layers)
 if args.block_layers is not None:
     BLOCK_EXITS = [int(x) for x in args.block_layers.split(",")]
@@ -111,23 +110,9 @@ else:
     step = n_total_layers // args.edap_blocks
     BLOCK_EXITS = [step * (i + 1) - 1 for i in range(args.edap_blocks)]
 
-# validate
 for lidx in BLOCK_EXITS:
     assert 0 <= lidx < n_total_layers, f"Block exit {lidx} out of range (0-{n_total_layers-1})"
-
-block_exits: list = []
-
-
-def _capture_hook(module, inp, out):
-    # out is a tuple for most HF implementations
-    block_exits.append(out[0].detach())
-
-
-hooks = []
-for lidx in BLOCK_EXITS:
-    h = model.model.layers[lidx].register_forward_hook(_capture_hook)
-    hooks.append(h)
-print(f"{len(hooks)} hooks registered at layers {BLOCK_EXITS}")
+print(f"Block exits: {BLOCK_EXITS}")
 
 # -- EDAP plugins ---------------------------------------------------
 
@@ -208,22 +193,12 @@ for epoch in range(args.epochs):
         labels = batch["labels"].to(device)
         attn_mask = batch["attention_mask"].to(device)
 
-        # forward through frozen backbone, hooks collect block exits
-        block_exits.clear()
-        with torch.no_grad():
-            emb = model.model.embed_tokens(input_ids)
-            _ = model.model(inputs_embeds=emb, attention_mask=attn_mask)
-
-        # EDAP chain
-        r_prev = [emb.detach().to(COMPUTE_DTYPE)]
-        for r_blk, plug in zip(block_exits, edap_plugins):
-            sources = r_prev + [r_blk.to(COMPUTE_DTYPE)]
-            r_fused, _ = plug(sources, shuffle_depth=args.shuffle_depth)
-            r_prev.append(r_fused)
-
-        # Full-sequence teacher-forcing loss over all answer tokens
-        # r_prev[-1]: [B, S, d] → lm_head → [B, S, V]
-        logits = model.lm_head(r_prev[-1])  # [B, S, vocab]
+        # EDAP-interleaved forward: backbone runs in no_grad, EDAP
+        # fuses at each block boundary and injects back into residual stream
+        logits = edap_forward(
+            model, input_ids, attn_mask, edap_plugins,
+            BLOCK_EXITS, COMPUTE_DTYPE, shuffle_depth=args.shuffle_depth,
+        )  # [B, S, V]
         # Shift: predict token[t] from hidden[t-1]
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
@@ -272,17 +247,10 @@ for epoch in range(args.epochs):
                 labels = batch["labels"].to(device)
                 attn_mask = batch["attention_mask"].to(device)
 
-                block_exits.clear()
-                emb = model.model.embed_tokens(input_ids)
-                _ = model.model(inputs_embeds=emb, attention_mask=attn_mask)
-
-                r_prev = [emb.detach().to(COMPUTE_DTYPE)]
-                for r_blk, plug in zip(block_exits, edap_plugins):
-                    sources = r_prev + [r_blk.to(COMPUTE_DTYPE)]
-                    r_fused, _ = plug(sources, shuffle_depth=args.shuffle_depth)
-                    r_prev.append(r_fused)
-
-                logits = model.lm_head(r_prev[-1])
+                logits = edap_forward(
+                    model, input_ids, attn_mask, edap_plugins,
+                    BLOCK_EXITS, COMPUTE_DTYPE, shuffle_depth=args.shuffle_depth,
+                )  # [B, S, V] — edap_forward uses no_grad internally for backbone
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_labels = labels[:, 1:].contiguous()
                 loss = F.cross_entropy(
@@ -348,10 +316,6 @@ for epoch in range(args.epochs):
 
         edap_plugins.train()
 
-        edap_plugins.train()
-
-for h in hooks:
-    h.remove()
 if args.wandb:
     wandb.finish()
 print("Done.")

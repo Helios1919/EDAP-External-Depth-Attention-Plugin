@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import List, Optional
 
 
 class EDAPPlugin(nn.Module):
@@ -89,3 +90,101 @@ def create_edap_plugins(d_model=3584, n_heads=4, n_blocks=4, dropout=0.1):
         EDAPPlugin(n_sources=i + 2, d_model=d_model, n_heads=n_heads, dropout=dropout)
         for i in range(n_blocks)
     ])
+
+
+def edap_forward(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    edap_plugins: nn.ModuleList,
+    block_exits: List[int],
+    compute_dtype: torch.dtype,
+    shuffle_depth: bool = False,
+):
+    """Run frozen backbone interleaved with EDAP at block boundaries.
+
+    EDAP-fused residual *replaces* the hidden state flowing into the next block,
+    unlike the original post-hoc design where EDAP ran only after all 28 layers.
+
+    Forward flow (example 4 blocks on 28 layers):
+
+        emb → [L0..L6]  → b0 → EDAP0(emb, b0) = r0
+                                  │ inject r0 as residual
+                                  ▼
+               [L7..L13] → b1 → EDAP1(emb, r0, b1) = r1
+                                  │ inject r1 as residual
+                                  ▼
+               [L14..L20] → b2 → EDAP2(emb, r0, r1, b2) = r2
+                                  │ inject r2 as residual
+                                  ▼
+               [L21..L27] → b3 → EDAP3(emb, r0, r1, r2, b3) = r3 → lm_head
+
+    All backbone layers run under torch.no_grad(); EDAP plugins retain gradients.
+
+    Args:
+        model:          Qwen2ForCausalLM with frozen backbone.
+        input_ids:      [B, S] token ids.
+        attention_mask: [B, S] or None.
+        edap_plugins:   ModuleList of EDAPPlugin, one per block boundary.
+        block_exits:    layer indices that mark block boundaries, e.g. [6,13,20,27].
+        compute_dtype:  torch.bfloat16 / float16 for EDAP computation.
+        shuffle_depth:  randomise source order (ablation).
+
+    Returns:
+        logits:  [B, S, V] prediction logits from lm_head.
+    """
+    device = input_ids.device
+    B, S = input_ids.shape
+
+    # ---- build block ranges ------------------------------------------------
+    block_ranges = []
+    prev_end = -1
+    for exit_layer in block_exits:
+        block_ranges.append((prev_end + 1, exit_layer))
+        prev_end = exit_layer
+
+    # ---- embedding & mask --------------------------------------------------
+    with torch.no_grad():
+        hidden_states = model.model.embed_tokens(input_ids)
+        cache_position = torch.arange(S, device=device)
+        causal_mask = model.model._update_causal_mask(
+            attention_mask=attention_mask,
+            input_tensor=hidden_states,
+            cache_position=cache_position,
+            past_key_values=None,
+            output_attentions=False,
+        )
+        position_ids = cache_position.unsqueeze(0).expand(B, -1)
+
+    emb = hidden_states.detach().to(compute_dtype)
+    fused_outputs: List[torch.Tensor] = []
+    current = hidden_states  # requires_grad=False from frozen embed
+
+    # ---- interleaved blocks + EDAP -----------------------------------------
+    for blk_idx, (start, end) in enumerate(block_ranges):
+        # 1. Run this block's transformer layers (no grad)
+        with torch.no_grad():
+            for layer_idx in range(start, end + 1):
+                current = model.model.layers[layer_idx](
+                    current,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                )[0]
+
+        # 2. Capture block exit (detached from graph)
+        block_out = current.detach().to(compute_dtype)
+
+        # 3. EDAP cross-depth fusion  (gradients flow through EDAP params)
+        sources: List[torch.Tensor] = [emb] + fused_outputs + [block_out]
+        fused, _weights = edap_plugins[blk_idx](
+            sources, shuffle_depth=shuffle_depth,
+        )
+        fused_outputs.append(fused)
+
+        # 4. Inject fused residual as input to the NEXT block
+        if blk_idx < len(edap_plugins) - 1:
+            current = fused.to(current.dtype)
+
+    # ---- lm_head -----------------------------------------------------------
+    logits = model.lm_head(fused_outputs[-1])
+    return logits

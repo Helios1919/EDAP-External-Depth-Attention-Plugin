@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-from edap_plugin import create_edap_plugins
+from edap_plugin import create_edap_plugins, edap_forward
 from data_utils import ConFiQADataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -100,38 +100,29 @@ def compute_metrics(pred_text, gt_text):
 # evaluation runners
 
 def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, temperature=0.0):
-    """Generate full answer through the EDAP-modified forward path."""
-    block_exits = []
+    """Generate answer with EDAP interleaved at block boundaries.
 
-    def _hook(m, inp, out):
-        block_exits.append(out[0].detach())
-
+    At each step the full growing sequence goes through the frozen backbone
+    (in no_grad) with EDAP injection at each block boundary, then lm_head
+    on the last position produces the next token.
+    """
     # Resolve block layers from number of plugins (detect from model layer count)
     n_total = len(model.model.layers)
     n_blocks = len(edap_plugins)
     step = n_total // n_blocks
-    block_layers = [step * (i + 1) - 1 for i in range(n_blocks)]
-
-    handles = []
-    for i in block_layers:
-        handles.append(model.model.layers[i].register_forward_hook(_hook))
+    BLOCK_EXITS = [step * (i + 1) - 1 for i in range(n_blocks)]
 
     generated = []
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
 
     for _ in range(max_new):
-        block_exits.clear()
-        with torch.no_grad():
-            emb = model.model.embed_tokens(input_ids)
-            _ = model.model(inputs_embeds=emb, attention_mask=None)
+        # EDAP-interleaved forward: returns [1, S, V]
+        logits = edap_forward(
+            model, input_ids, None, edap_plugins,
+            BLOCK_EXITS, COMPUTE_DTYPE, shuffle_depth=False,
+        )
+        next_logits = logits[0, -1, :]
 
-        r_prev = [emb.detach().to(COMPUTE_DTYPE)]
-        for r_blk, plug in zip(block_exits, edap_plugins):
-            sources = r_prev + [r_blk.to(COMPUTE_DTYPE)]
-            r_fused, _ = plug(sources, shuffle_depth=False)
-            r_prev.append(r_fused)
-
-        next_logits = model.lm_head(r_prev[-1][0, -1, :])
         if temperature > 0:
             next_logits = next_logits / temperature
             next_id = torch.multinomial(F.softmax(next_logits, dim=-1), 1)
@@ -142,9 +133,6 @@ def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, te
         if next_id.item() == tokenizer.eos_token_id:
             break
         input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
-
-    for h in handles:
-        h.remove()
 
     return tokenizer.decode(generated, skip_special_tokens=True)
 
