@@ -1,11 +1,12 @@
-"""将 ConFiQA 官方原始 JSON 转换为 data_utils 需要的统一格式。
+"""Convert raw ConFiQA JSON into the unified format expected by data_utils.
 
-每个原始样本产生两条：
-  - context_required: 用 orig_context, 答案在上下文中
-  - counterfactual:   用 cf_context (含错误事实), 正确答案靠记忆
+Each raw sample produces two entries:
+  - context_required:  uses orig_context (answer appears in context)
+  - counterfactual:    uses cf_context (contains false facts; correct answer
+                       relies on parametric knowledge)
 
-去污染: 检测反事实上下文中是否包含正确答案子串，
-        若泄露则标记并尝试替换为 MASK token。
+Decontamination: detect whether the counterfactual context leaks the
+memory-truth answer substring. If so, flag it and replace with [MASK].
 """
 
 import json
@@ -83,7 +84,7 @@ for fname in files:
 random.seed(SEED)
 random.shuffle(samples)
 
-# 按类型分层切分 train/test
+# Stratified train/test split by sample type
 cc_samples = [s for s in samples if s["type"] == "counterfactual"]
 cr_samples = [s for s in samples if s["type"] == "context_required"]
 ci_samples = [s for s in samples if s["type"] == "context_irrelevant"]
@@ -103,13 +104,13 @@ with open(TRAIN_DST, "w", encoding="utf-8") as f:
 with open(TEST_DST, "w", encoding="utf-8") as f:
     json.dump(test_samples, f, ensure_ascii=False, indent=2)
 
-# 统计
+# Summary
 from collections import Counter
 for name, subset in [("train", train_samples), ("test", test_samples)]:
     cnt = Counter(s["type"] for s in subset)
     cfg = Counter(s["config"] for s in subset)
     leaked_n = sum(1 for s in subset if s.get("_answer_leaked"))
-    print(f"✅ {name}: {len(subset)} 条  →  type {dict(cnt)}  config {dict(cfg)}")
+    print(f"[{name}] {len(subset)} samples  →  type {dict(cnt)}  config {dict(cfg)}")
     if leaked_n:
         print(f"   ⚠️  Answer leak in cf_context: {leaked_n} samples (replaced with [MASK])")
 if leak_warnings:

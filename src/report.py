@@ -35,7 +35,7 @@ from evaluate import (
 )
 
 
-# ── CLI ──────────────────────────────────────────────────────────────
+# --- CLI ---
 
 def parse_args():
     p = argparse.ArgumentParser(description="EDAP Prototype Report Generator")
@@ -57,7 +57,7 @@ def parse_args():
     return p.parse_args()
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
+# --- helpers ---
 
 def _result_path(output_dir, dataset, method):
     safe = dataset.replace("-", "_")
@@ -69,7 +69,7 @@ def _load_json_results(path):
         return json.load(f)
 
 
-# ── Evaluation orchestration ──────────────────────────────────────────
+# --- evaluation ---
 
 METHODS = ["greedy", "cad", "dola", "edap", "edap_random"]
 
@@ -144,7 +144,7 @@ def run_all_evaluations(args, model, tokenizer, datasets, edap_plugins,
     return all_results, attn_data
 
 
-# ── Success criteria ──────────────────────────────────────────────────
+# --- success criteria ---
 
 def evaluate_success_criteria(all_results, attn_data):
     """Check all success criteria against prototype-experiment.md."""
@@ -245,7 +245,7 @@ def evaluate_success_criteria(all_results, attn_data):
     }
 
 
-# ── Report builders ───────────────────────────────────────────────────
+# --- report ---
 
 def _em_cell(all_results, ds, method):
     r = all_results.get((ds, method), {})
@@ -421,7 +421,7 @@ def analyze_failures(all_results, max_per_type=5):
     return "\n".join(lines)
 
 
-# ── Heatmap ───────────────────────────────────────────────────────────
+# --- heatmap ---
 
 def generate_heatmap(attn_data, output_dir):
     """Generate attention heatmap: EDAP vs EDAP-random, per-plugin weights."""
@@ -501,7 +501,7 @@ def generate_heatmap(attn_data, output_dir):
     print(f"  Heatmap saved → {out_path}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────
+# --- main ---
 
 def write_report(args, all_results, attn_data, verdict):
     lines = []

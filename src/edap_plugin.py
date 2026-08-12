@@ -38,16 +38,15 @@ class EDAPPlugin(nn.Module):
 
         self.depth_embed = nn.Parameter(torch.randn(n_sources, d_total) * 0.1)
 
-        # Learnable baseline for delta-mode source 0.
-        # Prevents magnitude asymmetry: without it, source_0 K = W_K(emb)
-        # dominates softmax while later sources K = W_K(s_i - s_{i-1}) ≈ 0.
-        # With baseline: K_0 = W_K(emb - baseline), making all K's relative.
+        # Prevent magnitude asymmetry in delta mode: K_0 = W_K(emb - baseline)
+        # instead of W_K(emb), making all K's relative rather than dominated
+        # by the first source.
         self.baseline = nn.Parameter(torch.zeros(d_model))
 
         # Per-token soft gate: how much EDAP-fused output vs original block output
         self.W_gate = nn.Linear(d_model * 2, 1)
         nn.init.normal_(self.W_gate.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.W_gate.bias)  # sigmoid(0) = 0.5 at init
+        nn.init.zeros_(self.W_gate.bias)
 
         # init W_O near zero so the plugin starts as identity
         nn.init.normal_(self.W_O.weight, mean=0.0, std=1e-5)
@@ -216,14 +215,14 @@ def edap_forward(
     device = input_ids.device
     B, S = input_ids.shape
 
-    # ---- build block ranges ------------------------------------------------
+    # --- build block ranges ---
     block_ranges = []
     prev_end = -1
     for exit_layer in block_exits:
         block_ranges.append((prev_end + 1, exit_layer))
         prev_end = exit_layer
 
-    # ---- embedding & mask --------------------------------------------------
+    # --- embedding & mask ---
     with torch.no_grad():
         hidden_states = model.model.embed_tokens(input_ids)
         cache_position = torch.arange(S, device=device)
@@ -240,9 +239,9 @@ def edap_forward(
     fused_outputs: List[torch.Tensor] = []
     all_weights: List[torch.Tensor] = []
     all_gates: List[torch.Tensor] = []
-    current = hidden_states  # requires_grad=False from frozen embed
+    current = hidden_states
 
-    # ---- interleaved blocks + EDAP -----------------------------------------
+    # --- interleaved blocks + EDAP ---
     for blk_idx, (start, end) in enumerate(block_ranges):
         # 1. Run this block's transformer layers (no grad)
         with torch.no_grad():
@@ -275,7 +274,7 @@ def edap_forward(
             else:
                 current = fused.to(current.dtype)
 
-    # ---- lm_head -----------------------------------------------------------
+    # --- lm_head ---
     hidden = fused_outputs[-1]
     if gate_mode:
         # Apply the last EDAP plugin's gate to the final fused output.

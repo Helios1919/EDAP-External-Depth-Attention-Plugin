@@ -98,8 +98,7 @@ def compute_metrics(pred_text, gt_text):
     return pred, gt, em, em_prefix
 
 
-# ---------------------------------------------------------------
-# evaluation runners
+# --- baselines ---
 
 def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, temperature=0.0,
                           lm_head_bottleneck=None):
@@ -395,8 +394,7 @@ def summarize(results, method, ds_name, output_dir):
     print(f"Saved -> {out_path}")
 
 
-# ---------------------------------------------------------------
-# main
+# --- main ---
 
 if __name__ == "__main__":
     args = parse_args()

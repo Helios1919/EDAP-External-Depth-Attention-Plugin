@@ -1,5 +1,3 @@
-# Models & checkpoints (also symlinks)
-models
 models/
 checkpoints/
 logs/
@@ -8,38 +6,12 @@ results/
 *.pth
 *.bin
 *.safetensors
-
-# Data (large files; regenerate with convert_confiqa.py)
-data
 data/
 ConFiQA/
-ConFiQA
-
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-.ipynb_checkpoints/
-
-# IDE & tools
-.vscode/
-.claude/
-.idea/
-
-# Experiment planning (internal only)
-prototype-experiment.md
-
-# W&B
 wandb/
-
-# Logs
 *.log
-
-# OS
 .DS_Store
-Thumbs.db
-*.aux
-*.out
-*.toc
+edap-paper.tex
+

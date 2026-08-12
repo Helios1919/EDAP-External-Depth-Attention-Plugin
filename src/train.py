@@ -85,7 +85,7 @@ args = parser.parse_args()
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# V100 不支持 bf16，自动回退到 fp16；A100/H100 则用 bf16
+# V100 lacks bf16; fall back to fp16. A100/H100 use bf16.
 COMPUTE_DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
 # Auto-detect data disk for checkpoints (avoid filling system disk)
@@ -254,8 +254,7 @@ for epoch in range(args.epochs):
         labels = batch["labels"].to(device)
         attn_mask = batch["attention_mask"].to(device)
 
-        # EDAP-interleaved forward: backbone runs in no_grad, EDAP
-        # fuses at each block boundary and injects gated residual
+        # EDAP-interleaved forward (backbone frozen, EDAP gets gradients)
         logits, all_weights, all_gates = edap_forward(
             model, input_ids, attn_mask, edap_plugins,
             BLOCK_EXITS, COMPUTE_DTYPE,
@@ -267,13 +266,11 @@ for epoch in range(args.epochs):
             lm_head_bottleneck=lm_head_bottleneck,
         )  # logits: [B, S, V]; all_weights: list of [B, S, H, N]
 
-        # ---- entropy regularisation (target-based) -------------------------
-        # Penalise deviation from a target entropy, preventing both
-        # attention collapse (too low) and uniform routing (too high).
+        # ---- entropy regularisation ----
         if args.lambda_entropy > 0:
             entropy_loss = torch.tensor(0.0, device=device)
             for w in all_weights:
-                # w: [B, S, H, N]  — per-source entropy, averaged over B,S,H
+                # w: [B, S, H, N]
                 ent = -(w * torch.log(w + 1e-8)).sum(dim=-1)  # [B, S, H]
                 N = w.size(-1)
                 target_H = math.log(min(N, 3))  # encourage focusing on ~3 sources
@@ -282,9 +279,7 @@ for epoch in range(args.epochs):
         else:
             entropy_loss = torch.tensor(0.0, device=device)
 
-        # ---- gate regularisation --------------------------------------------
-        # Penalise gate straying far from 0.5 → prevents EDAP from being
-        # bypassed entirely (gate≈0) or hard-replacing backbone (gate≈1).
+        # ---- gate regularisation ----
         if args.lambda_gate_reg > 0:
             gate_reg = torch.tensor(0.0, device=device)
             for g in all_gates:
@@ -293,7 +288,7 @@ for epoch in range(args.epochs):
         else:
             gate_reg = torch.tensor(0.0, device=device)
 
-        # Shift: predict token[t] from hidden[t-1]
+        # Next-token prediction shift
         # Cast to fp32 for CE — bf16 logits can overflow in log_softmax
         # when bottleneck amplifies hidden states, producing inf→NaN.
         shift_logits = logits[:, :-1, :].contiguous().float()
