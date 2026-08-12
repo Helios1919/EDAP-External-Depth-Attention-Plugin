@@ -7,22 +7,34 @@ When a language model's parametric (memorized) knowledge contradicts external co
 ## Architecture
 
 ```
-Frozen Qwen2.5-7B (28 layers → 4 blocks of 7)
-          │
-Block 0 → [EDAP₀] → r'₀ ─┐
-Block 1 → [EDAP₁] → r'₁ ─┤
-Block 2 → [EDAP₂] → r'₂ ─┼─→ Trainable LM Head → Answer
-Block 3 → [EDAP₃] → r'₃ ─┘
+  Input ──→ [L0..L3] ──→ [EDAP₀] ──→ [L4..L7] ──→ [EDAP₁] ──→ ... ──→ [L24..L27] ──→ [EDAP₆] ──→ LM Head ──→ Answer
+               └─ frozen ─┘ └ trainable ┘└─ frozen ─┘ └ trainable ┘       └── frozen ──┘ └ trainable ┘
 ```
+> 7 backbone blocks (4 layers each, frozen) alternating with 7 EDAP plugins (trainable).
 
-Each EDAP plugin: 8-head cross-depth attention with 3× LayerNorm (input, key, output) and learnable depth position embeddings.
+> **Each EDAPₖ is a miniature cross-attention block:**
+>
+> ```
+>  sources = [emb, r₀, r₁, ..., rₖ₋₁, bₖ]     ← K, V  (frozen backbone outputs)
+>                            │
+>                    ┌───────▼───────┐
+>                    │  Cross-Attn   │  Q = bₖ  (current block, "what do I need?")
+>                    │  Q·Kᵀ / √d    │  K,V = sources  ("here's all available info")
+>                    └───────┬───────┘
+>                            │
+>                    ┌───────▼───────┐
+>                    │   Gate Mix    │  rₖ = gate · fused + (1−gate) · bₖ
+>                    └───────┬───────┘
+>                            │
+>                            ▼
+>                           rₖ  ──→  feeds into next block & all later EDAPs
+> ```
+> 
+> - **K, V** come from all prior sources — embedding + every earlier EDAP output + current block residual — giving each plugin a full view of the semantic trajectory from shallow to deep.
+> - **Q** comes from the current block's own output (`bₖ`), asking: "given where I am, which depth levels should I attend to?"
+> - **Gate mixing** prevents the plugin from overwriting non-conflict tokens: each token independently blends the EDAP-fused representation with the original block output.
+> - The fused output `rₖ` **replaces** the raw block output downstream — so later layers and later EDAPs all see the calibrated representation.
 
-| Component | Params |
-|-----------|--------|
-| EDAP plugins (4×) | 206M |
-| LM head (unfrozen) | 545M |
-| **Total trainable** | **751M (9.9% of backbone)** |
-| Qwen2.5-7B backbone | 7.6B (frozen) |
 
 ## Quick Start
 
