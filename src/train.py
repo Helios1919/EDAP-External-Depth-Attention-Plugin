@@ -294,7 +294,9 @@ for epoch in range(args.epochs):
             gate_reg = torch.tensor(0.0, device=device)
 
         # Shift: predict token[t] from hidden[t-1]
-        shift_logits = logits[:, :-1, :].contiguous()
+        # Cast to fp32 for CE — bf16 logits can overflow in log_softmax
+        # when bottleneck amplifies hidden states, producing inf→NaN.
+        shift_logits = logits[:, :-1, :].contiguous().float()
         shift_labels = labels[:, 1:].contiguous()
         ce_loss = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
@@ -305,12 +307,29 @@ for epoch in range(args.epochs):
         loss = (ce_loss
                 + args.lambda_entropy * entropy_loss
                 + args.lambda_gate_reg * gate_reg) / args.grad_accum
+
+        # NaN guard: if CE overflows despite fp32 (extremely rare), or if
+        # entropy/gate regularisation produces NaN, skip this micro-batch
+        # entirely to prevent gradient corruption from spreading.
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"[WARN] NaN/Inf loss at epoch {epoch+1} step {step+1} — skipping micro-batch")
+            optimizer.zero_grad()
+            epoch_loss += float('nan')
+            global_step += 1
+            continue
+
         loss.backward()
 
         if (step + 1) % args.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
-            optimizer.step()
-            scheduler.step()
+            # Clip gradients; skip step if any gradient is non-finite
+            # (belt-and-suspenders — fp32 CE should prevent this, but
+            #  EDAP delta attention can still produce NaN grads in bf16.)
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
+            if torch.isfinite(grad_norm):
+                optimizer.step()
+                scheduler.step()
+            else:
+                print(f"[WARN] Non-finite grad norm at epoch {epoch+1} step {step+1} — skipping optimizer step")
             optimizer.zero_grad()
 
         epoch_loss += loss.item() * args.grad_accum
@@ -372,7 +391,8 @@ for epoch in range(args.epochs):
                     collect_weights=False,
                     lm_head_bottleneck=lm_head_bottleneck,
                 )  # [B, S, V] — backbone inside no_grad
-                shift_logits = logits[:, :-1, :].contiguous()
+                # Cast to fp32 for stable CE (mirrors training fix)
+                shift_logits = logits[:, :-1, :].contiguous().float()
                 shift_labels = labels[:, 1:].contiguous()
                 loss = F.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
@@ -380,7 +400,8 @@ for epoch in range(args.epochs):
                     ignore_index=-100,
                     label_smoothing=args.label_smoothing,
                 )
-                val_loss += loss.item()
+                if torch.isfinite(loss):
+                    val_loss += loss.item()
 
         val_loss /= len(val_loader)
         print(f"=== Val loss: {val_loss:.4f} ===")
