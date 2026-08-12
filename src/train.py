@@ -311,9 +311,10 @@ for epoch in range(args.epochs):
         # NaN guard: if CE overflows despite fp32 (extremely rare), or if
         # entropy/gate regularisation produces NaN, skip this micro-batch
         # entirely to prevent gradient corruption from spreading.
+        # NOTE: do NOT zero_grad() here — if NaN occurs mid-cycle, valid
+        # gradients from earlier micro-batches should be preserved.
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"[WARN] NaN/Inf loss at epoch {epoch+1} step {step+1} — skipping micro-batch")
-            optimizer.zero_grad()
             epoch_loss += float('nan')
             global_step += 1
             continue
