@@ -29,6 +29,12 @@ def parse_args():
     p.add_argument("--output_dir", default="./results")
     p.add_argument("--max_samples", type=int, default=0)
     p.add_argument("--baseline", default=None, choices=["greedy", "cad", "dola"])
+    p.add_argument("--cad_alpha", type=float, default=1.0,
+                    help="Contrast strength for CAD baseline (default 1.0)")
+    p.add_argument("--dola_early_exit", type=int, default=13,
+                    help="Early exit layer for DoLa baseline (default 13)")
+    p.add_argument("--temperature", type=float, default=0.0,
+                    help="Sampling temperature; 0 = greedy, >0 = multinomial sampling")
     return p.parse_args()
 
 
@@ -93,19 +99,21 @@ def compute_metrics(pred_text, gt_text):
 # ---------------------------------------------------------------
 # evaluation runners
 
-def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32):
-    """Generate full answer through the EDAP-modified forward path.
-
-    Uses greedy decode with incremental EDAP: each new token goes through
-    the frozen backbone + EDAP chain, and lm_head on the last position.
-    """
+def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, temperature=0.0):
+    """Generate full answer through the EDAP-modified forward path."""
     block_exits = []
 
     def _hook(m, inp, out):
         block_exits.append(out[0].detach())
 
+    # Resolve block layers from number of plugins (detect from model layer count)
+    n_total = len(model.model.layers)
+    n_blocks = len(edap_plugins)
+    step = n_total // n_blocks
+    block_layers = [step * (i + 1) - 1 for i in range(n_blocks)]
+
     handles = []
-    for i in [6, 13, 20, 27]:
+    for i in block_layers:
         handles.append(model.model.layers[i].register_forward_hook(_hook))
 
     generated = []
@@ -124,7 +132,11 @@ def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32):
             r_prev.append(r_fused)
 
         next_logits = model.lm_head(r_prev[-1][0, -1, :])
-        next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+        if temperature > 0:
+            next_logits = next_logits / temperature
+            next_id = torch.multinomial(F.softmax(next_logits, dim=-1), 1)
+        else:
+            next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
         generated.append(next_id.item())
 
         if next_id.item() == tokenizer.eos_token_id:
@@ -138,13 +150,13 @@ def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32):
 
 
 def run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=False,
-             return_attn=False):
+             return_attn=False, temperature=0.0):
     """Evaluate EDAP by generating full answers, not single-token argmax."""
 
     results = []
     for s in tqdm(samples, desc="EDAP"):
         prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
-        pred_text = _generate_edap_answer(model, tokenizer, edap_plugins, prompt)
+        pred_text = _generate_edap_answer(model, tokenizer, edap_plugins, prompt, temperature=temperature)
 
         gt = s.get("correct_answer", "")
         pred_norm, gt_norm, em, em_prefix = compute_metrics(pred_text, gt)
@@ -207,23 +219,25 @@ def _build_attn_summary(attn_stats, n_plugins):
     }
 
 
-def _generate_greedy(model, tokenizer, prompt, max_new=32):
-    """Greedy decode using frozen Qwen backbone (no EDAP)."""
+def _generate_greedy(model, tokenizer, prompt, max_new=32, temperature=0.0):
+    """Greedy or temperature-sampling decode using frozen Qwen backbone."""
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
     with torch.no_grad():
         out_ids = model.generate(
-            input_ids, max_new_tokens=max_new, do_sample=False,
+            input_ids, max_new_tokens=max_new,
+            do_sample=(temperature > 0),
+            temperature=temperature if temperature > 0 else 1.0,
             pad_token_id=tokenizer.eos_token_id,
         )
     new_ids = out_ids[0, input_ids.shape[1]:]
     return tokenizer.decode(new_ids, skip_special_tokens=True)
 
 
-def run_greedy(samples, model, tokenizer):
+def run_greedy(samples, model, tokenizer, temperature=0.0):
     results = []
     for s in tqdm(samples, desc="Greedy"):
         prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
-        pred = _generate_greedy(model, tokenizer, prompt)
+        pred = _generate_greedy(model, tokenizer, prompt, temperature=temperature)
         gt = s.get("correct_answer", "")
         pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
         results.append({
@@ -354,6 +368,14 @@ def summarize(results, method, ds_name, output_dir):
         }
         print(f"  {src}: EM = {src_em:.2f}% | Prefix-EM = {src_em_prefix:.2f}% ({len(by_source[src])} samples)")
 
+    # Context-Faithfulness & Memory-Faithfulness metrics
+    ctx_faith_em = em_by_source.get("context", {}).get("em", 0.0)
+    ctx_faith_n = em_by_source.get("context", {}).get("n", 0)
+    mem_faith_em = em_by_source.get("param", {}).get("em", 0.0)
+    mem_faith_n = em_by_source.get("param", {}).get("n", 0)
+    print(f"  Context-Faithfulness: {ctx_faith_em:.2f}% ({ctx_faith_n} samples)")
+    print(f"  Memory-Faithfulness:  {mem_faith_em:.2f}% ({mem_faith_n} samples)")
+
     out_path = Path(output_dir) / f"{ds_name}_{method}.json"
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump({
@@ -361,6 +383,8 @@ def summarize(results, method, ds_name, output_dir):
             "em": em, "em_prefix": em_prefix,
             "n_samples": len(results),
             "em_by_source": em_by_source,
+            "context_faithfulness_em": ctx_faith_em,
+            "memory_faithfulness_em": mem_faith_em,
             "results": results,
         }, f, indent=2, ensure_ascii=False)
     print(f"Saved -> {out_path}")
@@ -422,16 +446,19 @@ if __name__ == "__main__":
         print(f"\n{'='*50}\n{ds_name} ({len(samples)} samples)\n{'='*50}")
 
         if args.baseline:
-            runners = {
-                "greedy": run_greedy,
-                "cad": run_cad,
-                "dola": run_dola,
-            }
-            res = runners[args.baseline](samples, model, tokenizer)
+            if args.baseline == "greedy":
+                res = run_greedy(samples, model, tokenizer, temperature=args.temperature)
+            elif args.baseline == "cad":
+                res = run_cad(samples, model, tokenizer, alpha=args.cad_alpha)
+            elif args.baseline == "dola":
+                res = run_dola(samples, model, tokenizer, early_exit=args.dola_early_exit)
+            else:
+                raise ValueError(f"Unknown baseline: {args.baseline}")
             method = args.baseline
         else:
             shuffle = args.shuffle_depth
-            res = run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=shuffle)
+            res = run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=shuffle,
+                           temperature=args.temperature)
             method = "edap_random" if shuffle else "edap"
 
         summarize(res, method, ds_name, args.output_dir)

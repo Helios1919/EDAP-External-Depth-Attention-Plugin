@@ -25,6 +25,7 @@ class ConFiQADataset(Dataset):
         augment_counterfactual: bool = True,
         tokenizer=None,
         max_seq_length: int = 1024,
+        seed: int = 42,
     ):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
@@ -71,6 +72,7 @@ class ConFiQADataset(Dataset):
                 n_flipped += 1
             print(f"Augmented: {n_flipped} flipped samples (total={len(self.samples)})")
 
+        random.seed(seed)
         random.shuffle(self.samples)
 
     def __len__(self):
@@ -104,6 +106,10 @@ class ConFiQADataset(Dataset):
         # Find last non-padding position (the true end of the answer)
         non_pad_mask = (tokens["input_ids"][0] != self.tokenizer.pad_token_id)
         last_answer_pos = non_pad_mask.nonzero(as_tuple=True)[0][-1].item()
+
+        # Mask padding tokens AFTER the answer end too — otherwise the model
+        # is trained to predict ~800 pad tokens per sample, diluting the signal.
+        labels[0, last_answer_pos + 1:] = -100
 
         return {
             "input_ids": tokens["input_ids"][0],

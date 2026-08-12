@@ -27,7 +27,7 @@ class EDAPPlugin(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        self.depth_embed = nn.Parameter(torch.randn(n_sources, d_total) * 0.02)
+        self.depth_embed = nn.Parameter(torch.randn(n_sources, d_total) * 0.1)
 
         # init W_O near zero so the plugin starts as identity
         nn.init.normal_(self.W_O.weight, mean=0.0, std=1e-5)

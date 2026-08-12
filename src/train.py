@@ -27,12 +27,20 @@ parser.add_argument("--edap_blocks", type=int, default=4)
 parser.add_argument("--edap_heads", type=int, default=8)
 parser.add_argument("--edap_dropout", type=float, default=0.1,
                     help="Dropout rate in EDAP plugins")
+parser.add_argument("--block_layers", type=str, default=None,
+                    help="Comma-separated block boundary layer indices, e.g. '6,13,20,27'. "
+                         "If not set, auto-computed evenly from 28 layers given --edap_blocks.")
 parser.add_argument("--epochs", type=int, default=5)
 parser.add_argument("--batch_size", type=int, default=8,
                     help="A100 default 8; reduce to 2 for V100-32GB")
 parser.add_argument("--grad_accum", type=int, default=2,
                     help="effective batch = batch_size * grad_accum (16 for A100)")
-parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--lr", type=float, default=1e-4,
+                    help="Unified learning rate (used for both EDAP and lm_head unless overridden)")
+parser.add_argument("--lr_edap", type=float, default=None,
+                    help="Learning rate for EDAP plugins (defaults to --lr)")
+parser.add_argument("--lr_lm_head", type=float, default=None,
+                    help="Learning rate for lm_head (defaults to --lr)")
 parser.add_argument("--warmup_steps", type=int, default=450)
 parser.add_argument("--weight_decay", type=float, default=0.01)
 parser.add_argument("--label_smoothing", type=float, default=0.1,
@@ -42,6 +50,8 @@ parser.add_argument("--val_split", type=float, default=0.2,
                     help="Fraction of training data held out for validation")
 parser.add_argument("--early_stop_patience", type=int, default=2,
                     help="Stop if val loss doesn't improve for N epochs (0 = off)")
+parser.add_argument("--no_flip_augmentation", action="store_true",
+                    help="Disable flipped counterfactual augmentation (ablation)")
 parser.add_argument("--shuffle_depth", action="store_true")
 parser.add_argument("--dry_run", action="store_true")
 parser.add_argument("--wandb", action="store_true", default=False)
@@ -92,8 +102,19 @@ print(f"Trainable / total: {trainable:,} / {total:,} ({100*trainable/total:.1f}%
 
 # -- hooks: grab hidden states at block boundaries -------------------
 
-# Qwen2.5-7B has 28 layers, split into 4 blocks of 7
-BLOCK_EXITS = [6, 13, 20, 27]
+# Resolve block exits from CLI or auto-compute from 28 layers
+n_total_layers = len(model.model.layers)
+if args.block_layers is not None:
+    BLOCK_EXITS = [int(x) for x in args.block_layers.split(",")]
+else:
+    # auto-compute evenly-spaced exits: e.g. 4 blocks → [6,13,20,27]
+    step = n_total_layers // args.edap_blocks
+    BLOCK_EXITS = [step * (i + 1) - 1 for i in range(args.edap_blocks)]
+
+# validate
+for lidx in BLOCK_EXITS:
+    assert 0 <= lidx < n_total_layers, f"Block exit {lidx} out of range (0-{n_total_layers-1})"
+
 block_exits: list = []
 
 
@@ -126,8 +147,8 @@ print("Loading data...")
 train_dataset = ConFiQADataset(
     data_path=args.data_path, split="train",
     max_samples=100 if args.dry_run else None,
-    augment_counterfactual=True,
-    tokenizer=tokenizer, max_seq_length=args.max_seq_length,
+    augment_counterfactual=not args.no_flip_augmentation,
+    tokenizer=tokenizer, max_seq_length=args.max_seq_length, seed=42,
 )
 
 # ---- validation split ----
@@ -148,11 +169,18 @@ else:
 
 # -- optimizer -------------------------------------------------------
 
+lr_edap = args.lr_edap if args.lr_edap is not None else args.lr
+lr_lm_head = args.lr_lm_head if args.lr_lm_head is not None else args.lr
+print(f"LR: edap={lr_edap:.1e}  lm_head={lr_lm_head:.1e}")
+
 edap_params = list(edap_plugins.parameters())
 lm_head_params = [p for n, p in model.named_parameters() if "lm_head" in n and p.requires_grad]
 all_trainable = edap_params + lm_head_params
 
-optimizer = AdamW(all_trainable, lr=args.lr, weight_decay=args.weight_decay)
+optimizer = AdamW([
+    {"params": edap_params, "lr": lr_edap},
+    {"params": lm_head_params, "lr": lr_lm_head},
+], lr=args.lr, weight_decay=args.weight_decay)
 total_steps = len(train_loader) * args.epochs // args.grad_accum
 
 # linear warmup → cosine decay
