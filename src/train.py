@@ -39,10 +39,10 @@ parser.add_argument("--no_delta", action="store_true",
 parser.add_argument("--no_gate", action="store_true",
                     help="Disable gated mixing (hard-replace residual)")
 parser.add_argument("--epochs", type=int, default=5)
-parser.add_argument("--batch_size", type=int, default=8,
-                    help="A100 default 8; reduce to 2 for V100-32GB")
-parser.add_argument("--grad_accum", type=int, default=2,
-                    help="effective batch = batch_size * grad_accum (16 for A100)")
+parser.add_argument("--batch_size", type=int, default=1,
+                    help="Per-step batch; A100-40GB safe with 1 (model ~38GB). Increase if using 80GB.")
+parser.add_argument("--grad_accum", type=int, default=16,
+                    help="effective batch = batch_size * grad_accum (default 16)")
 parser.add_argument("--lr", type=float, default=1e-4,
                     help="Unified learning rate (used for both EDAP and lm_head unless overridden)")
 parser.add_argument("--lr_edap", type=float, default=None,

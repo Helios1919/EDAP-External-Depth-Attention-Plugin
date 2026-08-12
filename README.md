@@ -49,11 +49,14 @@ python scripts/convert_confiqa.py
 # 3. Quick debug run (100 samples, 3 steps)
 python src/train.py --dry_run
 
-# 4. Full training (A100 defaults: batch=8, grad_accum=2)
+# 4. Full training (A100-40GB: batch=1, grad_accum=16, effective batch=16)
 python src/train.py
 
-#   V100 fallback:
+#   A100-80GB (more headroom):
 #   python src/train.py --batch_size 2 --grad_accum 8
+
+#   V100-32GB (fp16 auto-fallback):
+#   python src/train.py --batch_size 1 --grad_accum 16
 
 #   Skip validation split (train on all data):
 #   python src/train.py --val_split 0
@@ -89,8 +92,8 @@ python src/evaluate.py --checkpoint ./checkpoints/edap_best.pt --max_samples 500
 ## Requirements
 
 - Python 3.12+
-- **A100 40GB / 80GB recommended** (native bf16, batch_size=8)
-- V100 32GB works but needs manual override: `--batch_size 2 --grad_accum 8`
+- **A100 40GB / 80GB recommended** (native bf16, default batch_size=1 grad_accum=16)
+- V100 32GB works but needs manual override: `--batch_size 1 --grad_accum 16` (fp16)
 - See `environment.yml` or `requirements.txt` for Python dependencies
 
 ## Data
