@@ -19,7 +19,7 @@ When a language model's parametric (memorized) knowledge contradicts external co
 >                            │
 >                    ┌───────▼───────┐
 >                    │  Cross-Attn   │  Q = bₖ  (current block, "what do I need?")
->                    │  Q·Kᵀ / √d    │  K,V = sources  ("here's all available info")
+>                    │  Q·Kᵀ / √dₖ   │  K,V = sources  ("here's all available info")
 >                    └───────┬───────┘
 >                            │
 >                    ┌───────▼───────┐
