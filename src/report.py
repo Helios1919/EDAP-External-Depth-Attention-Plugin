@@ -604,10 +604,17 @@ def main():
 
     # load EDAP checkpoints
     print("Loading EDAP plugins...")
+    ckpt = torch.load(args.edap_ckpt, map_location=device, weights_only=False)
+    cfg = ckpt.get("config", {})
+    n_heads = cfg.get("edap_heads", 8)
+    n_blocks = cfg.get("edap_blocks", 4)
+    dropout = cfg.get("edap_dropout", 0.1)
+    print(f"  Checkpoint config: n_heads={n_heads}, n_blocks={n_blocks}")
+
     edap_plugins = create_edap_plugins(
-        d_model=model.config.hidden_size, n_heads=4, n_blocks=4,
+        d_model=model.config.hidden_size,
+        n_heads=n_heads, n_blocks=n_blocks, dropout=dropout,
     ).to(device).to(torch.bfloat16)
-    ckpt = torch.load(args.edap_ckpt, map_location=device)
     edap_plugins.load_state_dict(ckpt["edap_plugins"])
     # restore lm_head
     for name, p in model.named_parameters():
@@ -615,10 +622,16 @@ def main():
             p.data.copy_(ckpt["lm_head"][name])
     print(f"  EDAP loaded: {args.edap_ckpt}")
 
+    ckpt_r = torch.load(args.edap_random_ckpt, map_location=device, weights_only=False)
+    cfg_r = ckpt_r.get("config", {})
+    n_heads_r = cfg_r.get("edap_heads", 8)
+    n_blocks_r = cfg_r.get("edap_blocks", 4)
+    dropout_r = cfg_r.get("edap_dropout", 0.1)
+
     edap_random_plugins = create_edap_plugins(
-        d_model=model.config.hidden_size, n_heads=4, n_blocks=4,
+        d_model=model.config.hidden_size,
+        n_heads=n_heads_r, n_blocks=n_blocks_r, dropout=dropout_r,
     ).to(device).to(torch.bfloat16)
-    ckpt_r = torch.load(args.edap_random_ckpt, map_location=device)
     edap_random_plugins.load_state_dict(ckpt_r["edap_plugins"])
     print(f"  EDAP-random loaded: {args.edap_random_ckpt}")
 

@@ -141,13 +141,15 @@ def load_nq_swap(cache_path=None, max_samples=None):
 
     out = []
     for item in ds:
+        sub_ans = item["sub_answer"]
+        org_ans = item["org_answer"]
         out.append({
             "question": item["question"],
             "context": item["sub_context"],
-            "correct_answer": item["sub_answer"],
+            "correct_answer": sub_ans[0] if isinstance(sub_ans, list) else sub_ans,
             "correct_source": "context",
-            "original_answer": item["org_answer"],
-            "context_answer": item["sub_answer"],
+            "original_answer": org_ans[0] if isinstance(org_ans, list) else org_ans,
+            "context_answer": sub_ans[0] if isinstance(sub_ans, list) else sub_ans,
         })
 
     print(f"NQ-Swap: {len(out)} samples downloaded")

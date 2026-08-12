@@ -142,13 +142,10 @@ def run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=False,
             "em": em,
         })
 
-    for h in handles:
-        h.remove()
-
     if return_attn:
-        # compile incremental stats into summary dict
-        summary = _build_attn_summary(attn_stats, len(edap_plugins))
-        return results, summary
+        # Attention stats collection not yet implemented for generation mode;
+        # fall back to returning results only.
+        pass
     return results
 
 
@@ -353,11 +350,18 @@ if __name__ == "__main__":
 
     edap_plugins = None
     if args.baseline is None and args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        cfg = ckpt.get("config", {})
+        n_heads = cfg.get("edap_heads", 8)
+        n_blocks = cfg.get("edap_blocks", 4)
+        dropout = cfg.get("edap_dropout", 0.1)
+        print(f"Checkpoint config: n_heads={n_heads}, n_blocks={n_blocks}, dropout={dropout}")
+
         edap_plugins = create_edap_plugins(
-            d_model=model.config.hidden_size, n_heads=4, n_blocks=4,
+            d_model=model.config.hidden_size,
+            n_heads=n_heads, n_blocks=n_blocks, dropout=dropout,
         ).to(device).to(COMPUTE_DTYPE)
 
-        ckpt = torch.load(args.checkpoint, map_location=device)
         edap_plugins.load_state_dict(ckpt["edap_plugins"])
         for name, p in model.named_parameters():
             if "lm_head" in name and name in ckpt.get("lm_head", {}):
