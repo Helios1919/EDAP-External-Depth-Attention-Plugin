@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -48,6 +49,10 @@ parser.add_argument("--lr_edap", type=float, default=None,
                     help="Learning rate for EDAP plugins (defaults to --lr)")
 parser.add_argument("--lr_lm_head", type=float, default=None,
                     help="Learning rate for lm_head (defaults to --lr)")
+parser.add_argument("--freeze_lm_head", action="store_true",
+                    help="Freeze lm_head and insert a trainable d→d bottleneck; "
+                         "prevents the 545M lm_head from memorising dataset biases "
+                         "and forces EDAP to learn meaningful routing (recommended).")
 parser.add_argument("--warmup_steps", type=int, default=450)
 parser.add_argument("--weight_decay", type=float, default=0.01)
 parser.add_argument("--label_smoothing", type=float, default=0.1,
@@ -108,6 +113,21 @@ print("Freezing backbone...")
 for name, p in model.named_parameters():
     p.requires_grad = "lm_head" in name
 
+# Optional: freeze lm_head too and insert a small trainable bottleneck.
+# This prevents the 545M lm_head from memorising dataset biases and
+# forces EDAP to learn meaningful cross-depth routing.
+lm_head_bottleneck = None
+if args.freeze_lm_head:
+    for name, p in model.named_parameters():
+        if "lm_head" in name:
+            p.requires_grad = False
+    lm_head_bottleneck = nn.Linear(
+        model.config.hidden_size, model.config.hidden_size, bias=False,
+    ).to(device).to(COMPUTE_DTYPE)
+    nn.init.normal_(lm_head_bottleneck.weight, mean=0.0, std=0.02)
+    print(f"lm_head FROZEN — inserted trainable {model.config.hidden_size}→{model.config.hidden_size} bottleneck "
+          f"({sum(p.numel() for p in lm_head_bottleneck.parameters()):,} params)")
+
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total = sum(p.numel() for p in model.parameters())
 print(f"Trainable / total: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
@@ -133,6 +153,7 @@ edap_plugins = create_edap_plugins(
     n_heads=args.edap_heads,
     n_blocks=args.edap_blocks,
     dropout=args.edap_dropout,
+    shared_kv=args.shared_kv,
 ).to(device).to(COMPUTE_DTYPE)
 
 n_edap_params = sum(p.numel() for p in edap_plugins.parameters())
@@ -174,10 +195,17 @@ edap_params = list(edap_plugins.parameters())
 lm_head_params = [p for n, p in model.named_parameters() if "lm_head" in n and p.requires_grad]
 all_trainable = edap_params + lm_head_params
 
-optimizer = AdamW([
+param_groups = [
     {"params": edap_params, "lr": lr_edap},
     {"params": lm_head_params, "lr": lr_lm_head},
-], lr=args.lr, weight_decay=args.weight_decay)
+]
+if lm_head_bottleneck is not None:
+    bottleneck_params = list(lm_head_bottleneck.parameters())
+    all_trainable += bottleneck_params
+    param_groups.append({"params": bottleneck_params, "lr": lr_edap})
+    print(f"Bottleneck params: {sum(p.numel() for p in bottleneck_params):,}")
+
+optimizer = AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
 total_steps = len(train_loader) * args.epochs // args.grad_accum
 
 # linear warmup → cosine decay
@@ -207,13 +235,14 @@ for epoch in range(args.epochs):
 
         # EDAP-interleaved forward: backbone runs in no_grad, EDAP
         # fuses at each block boundary and injects gated residual
-        logits, all_weights = edap_forward(
+        logits, all_weights, all_gates = edap_forward(
             model, input_ids, attn_mask, edap_plugins,
             BLOCK_EXITS, COMPUTE_DTYPE,
             shuffle_depth=args.shuffle_depth,
             delta_mode=not args.no_delta,
             gate_mode=not args.no_gate,
             collect_weights=True,
+            lm_head_bottleneck=lm_head_bottleneck,
         )  # logits: [B, S, V]; all_weights: list of [B, S, H, N]
 
         # ---- entropy regularisation ------------------------------------------
@@ -252,9 +281,28 @@ for epoch in range(args.epochs):
         if global_step % 50 == 0:
             avg_loss = epoch_loss / (step + 1)
             lr = scheduler.get_last_lr()[0]
-            print(f"Epoch {epoch+1} step {global_step} | loss {avg_loss:.4f} lr {lr:.2e}")
+
+            # Gate stats: detect if gate collapses to 0 or 1
+            gate_mean = torch.stack([g.mean() for g in all_gates]).mean().item()
+            gate_std = torch.stack([g.std() for g in all_gates]).mean().item()
+
+            # Attention entropy per plugin: detect routing collapse
+            attn_ents = []
+            for w in all_weights:
+                ent = -(w * torch.log(w + 1e-8)).sum(dim=-1).mean().item()
+                attn_ents.append(ent)
+            avg_attn_ent = sum(attn_ents) / len(attn_ents)
+
+            print(f"Epoch {epoch+1} step {global_step} | loss {avg_loss:.4f} lr {lr:.2e} | gate μ={gate_mean:.3f} σ={gate_std:.3f} | attn_H={avg_attn_ent:.3f}")
             if args.wandb:
-                wandb.log({"train/loss": avg_loss, "train/lr": lr}, step=global_step)
+                wandb.log({
+                    "train/loss": avg_loss,
+                    "train/lr": lr,
+                    "train/gate_mean": gate_mean,
+                    "train/gate_std": gate_std,
+                    "train/attn_entropy": avg_attn_ent,
+                    "train/ce_loss": loss.item() * args.grad_accum - args.lambda_entropy * entropy_loss,
+                }, step=global_step)
 
         if args.dry_run and global_step >= 3:
             print("Dry run done.")
@@ -276,13 +324,14 @@ for epoch in range(args.epochs):
                 labels = batch["labels"].to(device)
                 attn_mask = batch["attention_mask"].to(device)
 
-                logits, _ = edap_forward(
+                logits = edap_forward(
                     model, input_ids, attn_mask, edap_plugins,
                     BLOCK_EXITS, COMPUTE_DTYPE, shuffle_depth=args.shuffle_depth,
                     delta_mode=not args.no_delta,
                     gate_mode=not args.no_gate,
-                    collect_weights=True,
-                )  # [B, S, V] — backbone inside no_grad; weights discarded in val
+                    collect_weights=False,
+                    lm_head_bottleneck=lm_head_bottleneck,
+                )  # [B, S, V] — backbone inside no_grad
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_labels = labels[:, 1:].contiguous()
                 loss = F.cross_entropy(
@@ -317,30 +366,39 @@ for epoch in range(args.epochs):
             # Remove old best checkpoint if exists
             for old in Path(args.output_dir).glob(f"{tag}_best*.pt"):
                 old.unlink()
-            torch.save({
+            ckpt_dict = {
                 "epoch": epoch + 1,
                 "edap_plugins": edap_plugins.state_dict(),
-                "lm_head": {n: p.clone() for n, p in model.named_parameters()
-                            if "lm_head" in n and p.requires_grad},
                 "val_loss": val_loss,
                 "global_step": global_step,
                 "config": vars(args),
-            }, ckpt_path)
+            }
+            # Save trainable lm_head params (or bottleneck if lm_head is frozen)
+            if lm_head_bottleneck is not None:
+                ckpt_dict["lm_head_bottleneck"] = lm_head_bottleneck.state_dict()
+            else:
+                ckpt_dict["lm_head"] = {n: p.clone() for n, p in model.named_parameters()
+                            if "lm_head" in n and p.requires_grad}
+            torch.save(ckpt_dict, ckpt_path)
             print(f"Best checkpoint -> {ckpt_path} (val_loss={val_loss:.4f})")
 
             # Also save a resume checkpoint with optimizer state
             resume_path = Path(args.output_dir) / f"{tag}_resume.pt"
-            torch.save({
+            resume_dict = {
                 "epoch": epoch + 1,
                 "edap_plugins": edap_plugins.state_dict(),
-                "lm_head": {n: p.clone() for n, p in model.named_parameters()
-                            if "lm_head" in n and p.requires_grad},
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "val_loss": val_loss,
                 "global_step": global_step,
                 "config": vars(args),
-            }, resume_path)
+            }
+            if lm_head_bottleneck is not None:
+                resume_dict["lm_head_bottleneck"] = lm_head_bottleneck.state_dict()
+            else:
+                resume_dict["lm_head"] = {n: p.clone() for n, p in model.named_parameters()
+                            if "lm_head" in n and p.requires_grad}
+            torch.save(resume_dict, resume_path)
 
         if args.early_stop_patience > 0 and patience_counter >= args.early_stop_patience:
             print(f"Early stopping at epoch {epoch+1} (best: epoch {best_epoch}, val_loss={best_val_loss:.4f})")

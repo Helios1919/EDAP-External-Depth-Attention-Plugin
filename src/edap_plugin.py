@@ -38,6 +38,12 @@ class EDAPPlugin(nn.Module):
 
         self.depth_embed = nn.Parameter(torch.randn(n_sources, d_total) * 0.1)
 
+        # Learnable baseline for delta-mode source 0.
+        # Prevents magnitude asymmetry: without it, source_0 K = W_K(emb)
+        # dominates softmax while later sources K = W_K(s_i - s_{i-1}) ≈ 0.
+        # With baseline: K_0 = W_K(emb - baseline), making all K's relative.
+        self.baseline = nn.Parameter(torch.zeros(d_model))
+
         # Per-token soft gate: how much EDAP-fused output vs original block output
         self.W_gate = nn.Linear(d_model * 2, 1)
         nn.init.normal_(self.W_gate.weight, mean=0.0, std=0.02)
@@ -71,7 +77,7 @@ class EDAPPlugin(nn.Module):
 
         # -- delta K ---------------------------------------------------------
         if delta_mode and N > 1:
-            R_K_list = [sources[0]]
+            R_K_list = [sources[0] - self.baseline]
             for i in range(1, N):
                 R_K_list.append(sources[i] - sources[i - 1])
             R_K = torch.stack(R_K_list, dim=0)  # [N, B, S, d]
@@ -158,6 +164,7 @@ def edap_forward(
     delta_mode: bool = True,
     gate_mode: bool = True,
     collect_weights: bool = False,
+    lm_head_bottleneck: Optional[nn.Module] = None,
 ):
     """Run frozen backbone interleaved with EDAP at block boundaries.
 
@@ -220,6 +227,7 @@ def edap_forward(
     emb = hidden_states.detach().to(compute_dtype)
     fused_outputs: List[torch.Tensor] = []
     all_weights: List[torch.Tensor] = []
+    all_gates: List[torch.Tensor] = []
     current = hidden_states  # requires_grad=False from frozen embed
 
     # ---- interleaved blocks + EDAP -----------------------------------------
@@ -244,6 +252,7 @@ def edap_forward(
         fused_outputs.append(fused)
         if collect_weights:
             all_weights.append(weights)
+            all_gates.append(gate)
 
         # 4. Gated mixing or hard replacement
         if gate_mode and blk_idx < len(edap_plugins) - 1:
@@ -252,8 +261,11 @@ def edap_forward(
             current = fused.to(current.dtype)
 
     # ---- lm_head -----------------------------------------------------------
-    logits = model.lm_head(fused_outputs[-1])
+    hidden = fused_outputs[-1]
+    if lm_head_bottleneck is not None:
+        hidden = lm_head_bottleneck(hidden.to(compute_dtype))
+    logits = model.lm_head(hidden)
 
     if collect_weights:
-        return logits, all_weights
+        return logits, all_weights, all_gates
     return logits

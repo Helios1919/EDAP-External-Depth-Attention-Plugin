@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
@@ -99,7 +100,8 @@ def compute_metrics(pred_text, gt_text):
 # ---------------------------------------------------------------
 # evaluation runners
 
-def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, temperature=0.0):
+def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, temperature=0.0,
+                          lm_head_bottleneck=None):
     """Generate answer with EDAP interleaved at block boundaries.
 
     At each step the full growing sequence goes through the frozen backbone
@@ -115,37 +117,41 @@ def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, te
     generated = []
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
 
-    for _ in range(max_new):
-        # EDAP-interleaved forward: returns [1, S, V]
-        logits = edap_forward(
-            model, input_ids, None, edap_plugins,
-            BLOCK_EXITS, COMPUTE_DTYPE,
-            shuffle_depth=False, delta_mode=True, gate_mode=True,
-        )
-        next_logits = logits[0, -1, :]
+    with torch.no_grad():
+        for _ in range(max_new):
+            # EDAP-interleaved forward: returns [1, S, V]
+            logits = edap_forward(
+                model, input_ids, None, edap_plugins,
+                BLOCK_EXITS, COMPUTE_DTYPE,
+                shuffle_depth=False, delta_mode=True, gate_mode=True,
+                lm_head_bottleneck=lm_head_bottleneck,
+            )
+            next_logits = logits[0, -1, :]
 
-        if temperature > 0:
-            next_logits = next_logits / temperature
-            next_id = torch.multinomial(F.softmax(next_logits, dim=-1), 1)
-        else:
-            next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
-        generated.append(next_id.item())
+            if temperature > 0:
+                next_logits = next_logits / temperature
+                next_id = torch.multinomial(F.softmax(next_logits, dim=-1), 1)
+            else:
+                next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+            generated.append(next_id.item())
 
-        if next_id.item() == tokenizer.eos_token_id:
-            break
-        input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
+            if next_id.item() == tokenizer.eos_token_id:
+                break
+            input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
 
     return tokenizer.decode(generated, skip_special_tokens=True)
 
 
 def run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=False,
-             return_attn=False, temperature=0.0):
+             return_attn=False, temperature=0.0, lm_head_bottleneck=None):
     """Evaluate EDAP by generating full answers, not single-token argmax."""
 
     results = []
     for s in tqdm(samples, desc="EDAP"):
         prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
-        pred_text = _generate_edap_answer(model, tokenizer, edap_plugins, prompt, temperature=temperature)
+        pred_text = _generate_edap_answer(model, tokenizer, edap_plugins, prompt,
+                                          temperature=temperature,
+                                          lm_head_bottleneck=lm_head_bottleneck)
 
         gt = s.get("correct_answer", "")
         pred_norm, gt_norm, em, em_prefix = compute_metrics(pred_text, gt)
@@ -395,23 +401,37 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
 
     edap_plugins = None
+    lm_head_bottleneck = None
     if args.baseline is None and args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         cfg = ckpt.get("config", {})
         n_heads = cfg.get("edap_heads", 8)
         n_blocks = cfg.get("edap_blocks", 4)
         dropout = cfg.get("edap_dropout", 0.1)
-        print(f"Checkpoint config: n_heads={n_heads}, n_blocks={n_blocks}, dropout={dropout}")
+        shared_kv = cfg.get("shared_kv", False)
+        print(f"Checkpoint config: n_heads={n_heads}, n_blocks={n_blocks}, dropout={dropout}, shared_kv={shared_kv}")
 
         edap_plugins = create_edap_plugins(
             d_model=model.config.hidden_size,
             n_heads=n_heads, n_blocks=n_blocks, dropout=dropout,
+            shared_kv=shared_kv,
         ).to(device).to(COMPUTE_DTYPE)
 
         edap_plugins.load_state_dict(ckpt["edap_plugins"])
-        for name, p in model.named_parameters():
-            if "lm_head" in name and name in ckpt.get("lm_head", {}):
-                p.data.copy_(ckpt["lm_head"][name])
+
+        # Load lm_head or bottleneck
+        if "lm_head_bottleneck" in ckpt:
+            lm_head_bottleneck = nn.Linear(
+                model.config.hidden_size, model.config.hidden_size, bias=False,
+            ).to(device).to(COMPUTE_DTYPE)
+            lm_head_bottleneck.load_state_dict(ckpt["lm_head_bottleneck"])
+            lm_head_bottleneck.eval()
+            print(f"Loaded bottleneck from checkpoint")
+        else:
+            for name, p in model.named_parameters():
+                if "lm_head" in name and name in ckpt.get("lm_head", {}):
+                    p.data.copy_(ckpt["lm_head"][name])
+        edap_plugins.eval()
         print(f"Loaded checkpoint: {args.checkpoint}")
 
     # --- load eval data ---
@@ -447,7 +467,8 @@ if __name__ == "__main__":
         else:
             shuffle = args.shuffle_depth
             res = run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=shuffle,
-                           temperature=args.temperature)
+                           temperature=args.temperature,
+                           lm_head_bottleneck=lm_head_bottleneck)
             method = "edap_random" if shuffle else "edap"
 
         summarize(res, method, ds_name, args.output_dir)
