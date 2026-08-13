@@ -310,7 +310,6 @@ for epoch in range(args.epochs):
         # gradients from earlier micro-batches should be preserved.
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"[WARN] NaN/Inf loss at epoch {epoch+1} step {step+1} — skipping micro-batch")
-            epoch_loss += float('nan')
             global_step += 1
             continue
 

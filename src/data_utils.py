@@ -85,6 +85,26 @@ class ConFiQADataset(Dataset):
                 n_flipped += 1
             print(f"Augmented: {n_flipped} flipped samples (total={len(self.samples)})")
 
+        # Filter samples whose prompt nearly fills the whole sequence, leaving too
+        # little room for the answer. For these, the label mask could set every
+        # token to -100, and cross_entropy returns NaN for an all-ignored batch.
+        # Reserve ANSWER_MARGIN tokens so each kept sample has a meaningful answer
+        # span to supervise on.
+        ANSWER_MARGIN = 32
+        if self.tokenizer is not None:
+            n_before = len(self.samples)
+            keep = []
+            for s in self.samples:
+                prompt = _PROMPT.format(context=s["context"], question=s["question"])
+                p_len = len(self.tokenizer(
+                    prompt, truncation=True, max_length=self.max_seq_length,
+                )["input_ids"])
+                if p_len < self.max_seq_length - ANSWER_MARGIN:
+                    keep.append(s)
+            self.samples = keep
+            if len(self.samples) < n_before:
+                print(f"Dropped {n_before - len(self.samples)} samples whose prompt overflows the sequence (no room for answer)")
+
         random.seed(seed)
         random.shuffle(self.samples)
 
