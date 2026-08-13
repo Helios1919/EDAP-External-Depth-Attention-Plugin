@@ -32,8 +32,11 @@ def parse_args():
     p.add_argument("--baseline", default=None, choices=["greedy", "cad", "dola"])
     p.add_argument("--cad_alpha", type=float, default=1.0,
                     help="Contrast strength for CAD baseline (default 1.0)")
-    p.add_argument("--dola_early_exit", type=int, default=8,
-                    help="Early exit layer for DoLa baseline (default 8, tuned for Qwen2.5-7B 28L)")
+    p.add_argument("--dola_early_exit", type=int, default=-1,
+                    help="Static early-exit layer for DoLa. -1 (default) = dynamic "
+                         "premature-layer selection (original DoLa, Chuang et al. 2024).")
+    p.add_argument("--dola_alpha", type=float, default=1.0,
+                    help="Contrast strength for DoLa (default 1.0)")
     p.add_argument("--temperature", type=float, default=0.0,
                     help="Sampling temperature; 0 = greedy, >0 = multinomial sampling")
     return p.parse_args()
@@ -289,61 +292,81 @@ def run_cad(samples, model, tokenizer, alpha=1.0):
     return results
 
 
-def run_dola(samples, model, tokenizer, early_exit=8):
-    """DoLa (Chuang et al., ICLR 2024) — generation with layer contrasting.
+def run_dola(samples, model, tokenizer, early_exit=-1, alpha=1.0):
+    """DoLa (Chuang et al., ICLR 2024) — decoding by contrasting layers.
 
-    Default early_exit=8 is tuned for Qwen2.5-7B (28 layers).
-    Original DoLa used early_exit=13 for LLaMA-7B (32 layers).
+    Original DoLa dynamically selects, at every decoding step, the premature
+    layer whose next-token distribution differs most from the final layer
+    (max JS divergence), then contrasts the two logits:
+
+        logits = (1 + alpha) * final - alpha * premature
+
+    Candidate premature layers follow the original implementation (every 2nd
+    layer, e.g. 0, 2, 4, ...), mapped to the backbone's layer count.
+
+    If `early_exit >= 0`, falls back to a *static* single-layer contrast
+    (simplified variant) for ablation.
     """
+    n_layers = len(model.model.layers)
+    if early_exit is not None and early_exit >= 0:
+        candidate_layers = [early_exit]
+    else:
+        # Original DoLa: every 2nd layer (LLaMA-32L -> 0..30 step 2)
+        candidate_layers = list(range(0, n_layers, 2))
+        if not candidate_layers:
+            candidate_layers = [n_layers // 2]
 
-    early_layer = model.model.layers[early_exit]
+    final_norm = model.model.norm
 
-    def _early_hook(m, inp, out):
-        _early_hook.state = out[0].detach()
+    def _js_div(p, q):
+        # p, q: softmax distributions over vocab; symmetric JS divergence
+        m = (p + q) / 2
+        return (F.kl_div(m.log(), p, reduction='sum') +
+                F.kl_div(m.log(), q, reduction='sum')) / 2
 
-    _early_hook.state = None
-    handle = early_layer.register_forward_hook(_early_hook)
+    results = []
+    for s in tqdm(samples, desc="DoLa"):
+        prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
+        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
+        generated = []
 
-    try:
-        results = []
-        for s in tqdm(samples, desc="DoLa"):
-            prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
-            input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
-            generated = []
+        for _ in range(32):
+            with torch.no_grad():
+                out = model(input_ids, output_hidden_states=True)
+                logits_final = out.logits[0, -1, :].float()
 
-            for _ in range(32):
-                _early_hook.state = None
-                with torch.no_grad():
-                    out = model(input_ids)
-                    logits_final = out.logits[0, -1, :]
+            probs_final = F.softmax(logits_final, dim=-1)
+            best_js = -1.0
+            logits_early = logits_final  # fallback = no contrast
+            for l in candidate_layers:
+                # hidden_states[0] = embedding, hidden_states[l+1] = layer l output
+                h = out.hidden_states[l + 1][0, -1, :].to(COMPUTE_DTYPE)
+                h = final_norm(h)
+                logits_l = model.lm_head(h.to(COMPUTE_DTYPE)).float()
+                probs_l = F.softmax(logits_l, dim=-1)
+                js = _js_div(probs_l, probs_final).item()
+                if js > best_js:
+                    best_js = js
+                    logits_early = logits_l
 
-                if _early_hook.state is not None:
-                    early_hidden = _early_hook.state[0, -1, :].to(COMPUTE_DTYPE)
-                    early_hidden = model.model.norm(early_hidden)
-                    logits_early = model.lm_head(early_hidden.to(COMPUTE_DTYPE)).float()
-                    logits = logits_final.float() - logits_early
-                else:
-                    logits = logits_final
+            logits = (1 + alpha) * logits_final - alpha * logits_early
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+            generated.append(next_id.item())
+            if next_id.item() == tokenizer.eos_token_id:
+                break
+            input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
 
-                next_id = torch.argmax(logits, dim=-1, keepdim=True)
-                generated.append(next_id.item())
-                if next_id.item() == tokenizer.eos_token_id:
-                    break
-                input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
+        pred = tokenizer.decode(generated, skip_special_tokens=True)
 
-            pred = tokenizer.decode(generated, skip_special_tokens=True)
-
-            gt = s.get("correct_answer", "")
-            pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
-            results.append({
-                "pred": pred_norm,
-                "gt": gt_norm,
-                "correct_source": s.get("correct_source", "unknown"),
-                "em": em,
-                "em_prefix": em_prefix,
-            })
-    finally:
-        handle.remove()
+        gt = s.get("correct_answer", "")
+        pred_norm, gt_norm, em, em_prefix = compute_metrics(pred, gt)
+        results.append({
+            "pred": pred_norm,
+            "gt": gt_norm,
+            "correct_source": s.get("correct_source", "unknown"),
+            "em": em,
+            "em_prefix": em_prefix,
+        })
     return results
 
 
@@ -352,7 +375,11 @@ def summarize(results, method, ds_name, output_dir):
         return
     em = sum(r["em"] for r in results) / len(results) * 100
     em_prefix = sum(r.get("em_prefix", 0) for r in results) / len(results) * 100
-    print(f"\n{method} on {ds_name}: EM = {em:.2f}% | Prefix-EM = {em_prefix:.2f}%")
+    # CAD/DoLa suppress the EOS token (stop-signal), so exact-match under-counts
+    # them; their fair primary metric is Prefix-EM (knows the answer but can't stop).
+    primary = "prefix_em" if method in ("cad", "dola") else "em"
+    primary_val = em_prefix if primary == "prefix_em" else em
+    print(f"\n{method} on {ds_name}: EM = {em:.2f}% | Prefix-EM = {em_prefix:.2f}% | primary({primary}) = {primary_val:.2f}%")
 
     by_source = {}
     by_source_prefix = {}
@@ -385,6 +412,7 @@ def summarize(results, method, ds_name, output_dir):
         json.dump({
             "method": method, "dataset": ds_name,
             "em": em, "em_prefix": em_prefix,
+            "primary_metric": primary,
             "n_samples": len(results),
             "em_by_source": em_by_source,
             "context_faithfulness_em": ctx_faith_em,
@@ -468,7 +496,8 @@ if __name__ == "__main__":
             elif args.baseline == "cad":
                 res = run_cad(samples, model, tokenizer, alpha=args.cad_alpha)
             elif args.baseline == "dola":
-                res = run_dola(samples, model, tokenizer, early_exit=args.dola_early_exit)
+                res = run_dola(samples, model, tokenizer, early_exit=args.dola_early_exit,
+                               alpha=args.dola_alpha)
             else:
                 raise ValueError(f"Unknown baseline: {args.baseline}")
             method = args.baseline
