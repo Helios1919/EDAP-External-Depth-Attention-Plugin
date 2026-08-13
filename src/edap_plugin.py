@@ -280,6 +280,10 @@ def edap_forward(
         # Apply the last EDAP plugin's gate to the final fused output.
         # Previously the last gate was computed but never used, wasting its params.
         hidden = (gate * hidden + (1 - gate) * block_out).to(hidden.dtype)
+    # Final RMSNorm: the vanilla Qwen forward applies model.model.norm before
+    # lm_head. Skipping it fed hidden states at RMS≈9.2 (vs the ~5 the frozen
+    # lm_head was trained on), exploding CE from ~10 → ~144.
+    hidden = model.model.norm(hidden.to(hidden.dtype))
     if lm_head_bottleneck is not None:
         hidden = lm_head_bottleneck(hidden.to(compute_dtype))
     logits = model.lm_head(hidden)

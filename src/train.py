@@ -133,13 +133,14 @@ if args.freeze_lm_head:
     lm_head_bottleneck = nn.Linear(
         model.config.hidden_size, model.config.hidden_size, bias=False,
     ).to(device).to(COMPUTE_DTYPE)
-    # Identity init + tiny perturbation: start ≈ original Qwen behaviour,
-    # matching EDAP's zero-init W_O "identity start" philosophy. A random
-    # init would scramble the residual stream at step 0 and inflate the
-    # initial loss, masking EDAP's learning signal.
+    # Pure identity init: the bottleneck is a no-op at step 0, so the model
+    # starts exactly at original Qwen behaviour (matching EDAP's zero-init W_O
+    # "identity start" philosophy). A random init would scramble the residual
+    # stream and inflate the initial loss, masking EDAP's learning signal.
+    # NOTE: even a "tiny" perturbation like 0.02*randn is scaled by √3584≈60
+    # through the d×d matmul, producing noise with std ≈1.2×‖hidden‖ — as bad
+    # as a random init. Use exact identity.
     nn.init.eye_(lm_head_bottleneck.weight)
-    with torch.no_grad():
-        lm_head_bottleneck.weight.add_(torch.randn_like(lm_head_bottleneck.weight) * 0.02)
     print(f"lm_head FROZEN — inserted trainable {model.config.hidden_size}→{model.config.hidden_size} bottleneck "
           f"({sum(p.numel() for p in lm_head_bottleneck.parameters()):,} params)")
 
