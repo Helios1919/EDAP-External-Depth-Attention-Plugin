@@ -85,7 +85,7 @@ python src/report.py --edap_ckpt /root/autodl-tmp/checkpoints/edap_best.pt \
 ### Evaluation Notes
 
 - All methods use **multi-token greedy generation** for fair comparison
-- **DoLa** uses `early_exit=8` tuned for Qwen2.5-7B (28 layers), not the original LLaMA default of 13
+- **DoLa** uses the original dynamic premature-layer selection: at every decoding step it picks the layer with max JS-divergence against the final layer (every 2nd layer, mapped to Qwen2.5-7B's 28 layers), then contrasts `(1+α)·final − α·premature` (`--dola_early_exit=-1` default, `--dola_alpha=1.0`). Pass `--dola_early_exit <layer>` for the static single-layer variant
 - Exact match (EM) and prefix-EM reported; prefix-EM catches models that know the answer but can't stop (common with CAD/DoLa)
 - Results broken down by `correct_source` (context / memory)
 - **Evaluates both NQ-Swap and ConFiQA** automatically; NQ-Swap auto-downloaded from HuggingFace
