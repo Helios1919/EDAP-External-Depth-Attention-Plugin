@@ -26,6 +26,7 @@ from datetime import datetime
 from collections import defaultdict
 
 import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from edap_plugin import create_edap_plugins
@@ -75,7 +76,7 @@ METHODS = ["greedy", "cad", "dola", "edap", "edap_random"]
 
 
 def load_or_run_method(method, dataset_name, samples, args, model, tokenizer,
-                       edap_plugins, edap_random_plugins):
+                       edap_plugins, edap_random_plugins, lm_head_bottleneck=None):
     """Run a single method on a single dataset, with resume support."""
     out_path = _result_path(args.output_dir, dataset_name, method)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -99,11 +100,13 @@ def load_or_run_method(method, dataset_name, samples, args, model, tokenizer,
         results, attn_summary = run_edap(
             samples, model, tokenizer, edap_plugins,
             shuffle_depth=False, return_attn=True,
+            lm_head_bottleneck=lm_head_bottleneck,
         )
     elif method == "edap_random":
         results, attn_summary = run_edap(
             samples, model, tokenizer, edap_random_plugins,
             shuffle_depth=True, return_attn=True,
+            lm_head_bottleneck=lm_head_bottleneck,
         )
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -121,7 +124,7 @@ def load_or_run_method(method, dataset_name, samples, args, model, tokenizer,
 
 
 def run_all_evaluations(args, model, tokenizer, datasets, edap_plugins,
-                        edap_random_plugins):
+                        edap_random_plugins, lm_head_bottleneck=None):
     """Run all method × dataset combinations and return collected results."""
     all_results = {}  # key: (dataset, method)
     attn_data = {}    # key: (dataset, method) — only for EDAP variants
@@ -134,7 +137,7 @@ def run_all_evaluations(args, model, tokenizer, datasets, edap_plugins,
         for method in METHODS:
             result = load_or_run_method(
                 method, ds_name, samples, args, model, tokenizer,
-                edap_plugins, edap_random_plugins,
+                edap_plugins, edap_random_plugins, lm_head_bottleneck,
             )
 
             all_results[(ds_name, method)] = result
@@ -149,18 +152,19 @@ def run_all_evaluations(args, model, tokenizer, datasets, edap_plugins,
 def evaluate_success_criteria(all_results, attn_data):
     """Check all success criteria against prototype-experiment.md."""
 
-    def _em(ds, method):
+    def _metric(ds, method):
         r = all_results.get((ds, method), {})
         res_list = r.get("results", [])
         if not res_list:
             return 0.0
-        return sum(x["em"] for x in res_list) / len(res_list) * 100
+        key = _fair_metric_key(method)
+        return sum(x[key] for x in res_list) / len(res_list) * 100
 
-    nq_edap = _em("NQ-Swap", "edap")
-    nq_dola = _em("NQ-Swap", "dola")
-    nq_random = _em("NQ-Swap", "edap_random")
-    nq_greedy = _em("NQ-Swap", "greedy")
-    nq_cad = _em("NQ-Swap", "cad")
+    nq_edap = _metric("NQ-Swap", "edap")
+    nq_dola = _metric("NQ-Swap", "dola")
+    nq_random = _metric("NQ-Swap", "edap_random")
+    nq_greedy = _metric("NQ-Swap", "greedy")
+    nq_cad = _metric("NQ-Swap", "cad")
 
     primary = {
         "edap_vs_dola": {
@@ -168,14 +172,14 @@ def evaluate_success_criteria(all_results, attn_data):
             "edap_em": round(nq_edap, 2),
             "baseline_em": round(nq_dola, 2),
             "delta": round(nq_edap - nq_dola, 2),
-            "label": "EDAP > DoLa on NQ-Swap",
+            "label": "EDAP > DoLa on NQ-Swap (EDAP-EM vs DoLa-Prefix-EM)",
         },
         "edap_vs_random": {
             "pass": nq_edap > nq_random,
             "edap_em": round(nq_edap, 2),
             "baseline_em": round(nq_random, 2),
             "delta": round(nq_edap - nq_random, 2),
-            "label": "EDAP > EDAP-random on NQ-Swap",
+            "label": "EDAP > EDAP-random on NQ-Swap (EM)",
         },
     }
     primary_pass = all(c["pass"] for c in primary.values())
@@ -186,14 +190,14 @@ def evaluate_success_criteria(all_results, attn_data):
             "edap_em": round(nq_edap, 2),
             "baseline_em": round(nq_greedy, 2),
             "delta": round(nq_edap - nq_greedy, 2),
-            "label": "EDAP > Greedy",
+            "label": "EDAP > Greedy (EM)",
         },
         "edap_vs_cad": {
             "pass": nq_edap >= nq_cad,
             "edap_em": round(nq_edap, 2),
             "baseline_em": round(nq_cad, 2),
             "delta": round(nq_edap - nq_cad, 2),
-            "label": "EDAP >= CAD",
+            "label": "EDAP >= CAD (EDAP-EM vs CAD-Prefix-EM)",
         },
     }
 
@@ -247,14 +251,22 @@ def evaluate_success_criteria(all_results, attn_data):
 
 # --- report ---
 
+# CAD & DoLa suppress the EOS token, which deflates their exact-match.
+# Their fair primary metric is Prefix-EM (they know the answer but can't stop).
+def _fair_metric_key(method):
+    return "em_prefix" if method in ("cad", "dola") else "em"
+
+
 def _em_cell(all_results, ds, method):
     r = all_results.get((ds, method), {})
     res_list = r.get("results", [])
     n = len(res_list)
     if n == 0:
         return "—"
-    em = sum(x["em"] for x in res_list) / n * 100
-    return f"{em:.1f}"
+    key = _fair_metric_key(method)
+    val = sum(x[key] for x in res_list) / n * 100
+    mark = "*" if key == "em_prefix" else ""
+    return f"{val:.1f}{mark}"
 
 
 def build_comparison_table(all_results, datasets):
@@ -270,6 +282,8 @@ def build_comparison_table(all_results, datasets):
                  "edap": "**EDAP (ours)**", "edap_random": "EDAP-random"}[method]
         cells = [_em_cell(all_results, d, method) for d in ds_names]
         lines.append("| " + label + " | " + " | ".join(cells) + " |")
+    lines.append("")
+    lines.append("*\\* = Prefix-EM (fair metric for CAD/DoLa, which suppress the EOS token); others use EM.*")
     return "\n".join(lines)
 
 
@@ -278,20 +292,23 @@ def build_per_source_table(all_results, ds_name, method):
     if not r:
         return f"*No results for {method} on {ds_name}*"
 
+    key = _fair_metric_key(method)
+    metric_label = "Prefix-EM" if key == "em_prefix" else "EM"
+
     by_source = defaultdict(list)
     for x in r:
-        by_source[x.get("correct_source", "unknown")].append(x["em"])
+        by_source[x.get("correct_source", "unknown")].append(x[key])
 
-    lines = [f"| Source Type | EM (%) | N Samples |",
+    lines = [f"| Source Type | {metric_label} (%) | N Samples |",
              "| --- | --- | --- |"]
     for st in sorted(by_source):
-        ems = by_source[st]
-        lines.append(f"| {st} | {sum(ems)/len(ems)*100:.1f} | {len(ems)} |")
+        vals = by_source[st]
+        lines.append(f"| {st} | {sum(vals)/len(vals)*100:.1f} | {len(vals)} |")
     return "\n".join(lines)
 
 
 def build_verdict_table(criteria_dict):
-    lines = ["| Criterion | Status | EDAP EM | Baseline EM | Δ |",
+    lines = ["| Criterion | Status | EDAP Metric | Baseline Metric | Δ |",
              "| --- | --- | --- | --- | --- |"]
     for _, c in criteria_dict.items():
         status = "✅ PASS" if c["pass"] else "❌ FAIL"
@@ -620,6 +637,16 @@ def main():
     for name, p in model.named_parameters():
         if "lm_head" in name and name in ckpt.get("lm_head", {}):
             p.data.copy_(ckpt["lm_head"][name])
+
+    # restore the trainable lm_head bottleneck (freeze_lm_head=True checkpoint)
+    lm_head_bottleneck = None
+    if "lm_head_bottleneck" in ckpt:
+        lm_head_bottleneck = nn.Linear(
+            model.config.hidden_size, model.config.hidden_size, bias=False,
+        ).to(device).to(torch.bfloat16)
+        lm_head_bottleneck.load_state_dict(ckpt["lm_head_bottleneck"])
+        lm_head_bottleneck.eval()
+        print("  Loaded lm_head bottleneck from checkpoint")
     print(f"  EDAP loaded: {args.edap_ckpt}")
 
     ckpt_r = torch.load(args.edap_random_ckpt, map_location=device, weights_only=False)
@@ -656,6 +683,7 @@ def main():
     print("\nRunning evaluations...")
     all_results, attn_data = run_all_evaluations(
         args, model, tokenizer, datasets, edap_plugins, edap_random_plugins,
+        lm_head_bottleneck,
     )
 
     # compute verdict

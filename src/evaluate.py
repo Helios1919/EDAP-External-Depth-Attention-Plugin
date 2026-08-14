@@ -104,12 +104,16 @@ def compute_metrics(pred_text, gt_text):
 # --- baselines ---
 
 def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, temperature=0.0,
-                          lm_head_bottleneck=None):
+                          lm_head_bottleneck=None, shuffle_depth=False, return_attn=False):
     """Generate answer with EDAP interleaved at block boundaries.
 
     At each step the full growing sequence goes through the frozen backbone
     (in no_grad) with EDAP injection at each block boundary, then lm_head
     on the last position produces the next token.
+
+    If return_attn=True, also returns per-plugin attention accumulators for
+    the last (predicted) position at every decoding step:
+        accum = [(sum[N], sum_sq[N], count), ...]  (one tuple per plugin)
     """
     # Resolve block layers from number of plugins (detect from model layer count)
     n_total = len(model.model.layers)
@@ -120,15 +124,39 @@ def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, te
     generated = []
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
 
+    # Per-plugin attention accumulators (used only when return_attn=True).
+    n_plugins = len(edap_plugins)
+    attn_sum = [None] * n_plugins
+    attn_sq = [None] * n_plugins
+    attn_cnt = [0.0] * n_plugins
+
     with torch.no_grad():
         for _ in range(max_new):
-            # EDAP-interleaved forward: returns [1, S, V]
-            logits = edap_forward(
+            # EDAP-interleaved forward: returns [1, S, V], or
+            # (logits, all_weights, all_gates) when collect_weights=True.
+            out = edap_forward(
                 model, input_ids, None, edap_plugins,
                 BLOCK_EXITS, COMPUTE_DTYPE,
-                shuffle_depth=False, delta_mode=True, gate_mode=True,
+                shuffle_depth=shuffle_depth, delta_mode=True, gate_mode=True,
                 lm_head_bottleneck=lm_head_bottleneck,
+                collect_weights=return_attn,
             )
+            if return_attn:
+                logits, all_weights, _ = out
+                # all_weights[i]: [B, S, H, N]. Average the predicted
+                # position's attention over heads -> [N] per plugin.
+                for pi, w in enumerate(all_weights):
+                    mean_w = w[0, -1].mean(dim=0)
+                    if attn_sum[pi] is None:
+                        attn_sum[pi] = mean_w.clone()
+                        attn_sq[pi] = (mean_w ** 2).clone()
+                    else:
+                        attn_sum[pi] += mean_w
+                        attn_sq[pi] += (mean_w ** 2)
+                    attn_cnt[pi] += 1.0
+            else:
+                logits = out
+
             next_logits = logits[0, -1, :]
 
             if temperature > 0:
@@ -142,19 +170,49 @@ def _generate_edap_answer(model, tokenizer, edap_plugins, prompt, max_new=32, te
                 break
             input_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=1)
 
+    if return_attn:
+        accum = [(attn_sum[pi], attn_sq[pi], attn_cnt[pi]) for pi in range(n_plugins)]
+        return tokenizer.decode(generated, skip_special_tokens=True), accum
     return tokenizer.decode(generated, skip_special_tokens=True)
 
 
 def run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=False,
              return_attn=False, temperature=0.0, lm_head_bottleneck=None):
-    """Evaluate EDAP by generating full answers, not single-token argmax."""
+    """Evaluate EDAP by generating full answers, not single-token argmax.
+
+    When return_attn=True, cross-depth attention weights are collected per
+    generated token and aggregated into a per-plugin × per-source-type summary
+    (see _build_attn_summary).
+    """
 
     results = []
+    n_plugins = len(edap_plugins)
+    # attn_stats: (plugin_idx, correct_source) -> [sum[N], sum_sq[N], count]
+    attn_stats = {}
+
     for s in tqdm(samples, desc="EDAP"):
         prompt = f"{s['context']}\n\nQuestion: {s['question']}\n\nAnswer:"
-        pred_text = _generate_edap_answer(model, tokenizer, edap_plugins, prompt,
-                                          temperature=temperature,
-                                          lm_head_bottleneck=lm_head_bottleneck)
+        out = _generate_edap_answer(model, tokenizer, edap_plugins, prompt,
+                                    temperature=temperature,
+                                    lm_head_bottleneck=lm_head_bottleneck,
+                                    shuffle_depth=shuffle_depth,
+                                    return_attn=return_attn)
+
+        if return_attn:
+            pred_text, accum = out
+            stype = s.get("correct_source", "unknown")
+            for pi, (sm, sq, cnt) in enumerate(accum):
+                if cnt <= 0 or sm is None:
+                    continue
+                key = (pi, stype)
+                if key not in attn_stats:
+                    attn_stats[key] = [sm.clone(), sq.clone(), float(cnt)]
+                else:
+                    attn_stats[key][0] += sm
+                    attn_stats[key][1] += sq
+                    attn_stats[key][2] += cnt
+        else:
+            pred_text = out
 
         gt = s.get("correct_answer", "")
         pred_norm, gt_norm, em, em_prefix = compute_metrics(pred_text, gt)
@@ -167,9 +225,7 @@ def run_edap(samples, model, tokenizer, edap_plugins, shuffle_depth=False,
         })
 
     if return_attn:
-        # Attention stats collection not yet implemented for generation mode;
-        # fall back to returning results only.
-        pass
+        return results, _build_attn_summary(attn_stats, n_plugins)
     return results, None
 
 
