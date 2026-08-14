@@ -67,8 +67,9 @@ parser.add_argument("--lambda_entropy", type=float, default=0.05,
                          "Penalises deviation from target entropy ln(min(N,3)), "
                          "preventing both attention collapse (too low) and uniform routing (too high).")
 parser.add_argument("--lambda_gate_reg", type=float, default=0.01,
-                    help="Gate L2 regularisation toward 0.5: prevents gate from collapsing "
-                         "to 0 (bypass EDAP) or 1 (hard-replace backbone) (0 = off)")
+                    help="Gate mean regularisation toward 0.5: prevents gate from "
+                         "collapsing to a global 0 (bypass EDAP) or 1 (hard-replace "
+                         "backbone), while keeping per-token variance (0 = off)")
 parser.add_argument("--flip_augmentation", action="store_true",
                     help="Enable flipped counterfactual augmentation (opt-in)")
 parser.add_argument("--edap_noise", type=float, default=0.02,
@@ -290,7 +291,12 @@ for epoch in range(args.epochs):
         if args.lambda_gate_reg > 0:
             gate_reg = torch.tensor(0.0, device=device)
             for g in all_gates:
-                gate_reg = gate_reg + ((g - 0.5) ** 2).mean()
+                # Constrain only the MEAN gate toward 0.5 (prevents the gate from
+                # collapsing to a global 0=bypass or 1=hard-replace), while leaving
+                # the per-token VARIANCE free. The old form ((g-0.5)**2).mean()
+                # also penalised variance, which crushed per-token discriminativity
+                # (observed: gate σ 0.25 → 0.06 over training).
+                gate_reg = gate_reg + ((g.mean() - 0.5) ** 2)
             gate_reg = gate_reg / len(all_gates)
         else:
             gate_reg = torch.tensor(0.0, device=device)

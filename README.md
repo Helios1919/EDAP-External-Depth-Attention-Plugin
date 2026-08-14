@@ -76,7 +76,7 @@ python src/report.py --edap_ckpt /root/autodl-tmp/checkpoints/edap_best.pt \
 - **Teacher forcing over full answer sequences** (not single-token classification)
 - **Exposure bias mitigation**: Gaussian noise on EDAP sources during training (`--edap_noise 0.02`, default) to bridge the teacher-forcing → autoregressive gap; set `--edap_noise 0` to disable
 - **Target-entropy regularization** (`--lambda_entropy 0.05`): penalizes attention distributions that collapse to a single source or become uniform
-- **Gate L2 regularization** (`--lambda_gate_reg 0.01`): encourages per-token gates near 0.5, preventing EDAP from being bypassed (gate→0) or hard-replacing the backbone (gate→1)
+- **Gate mean regularization** (`--lambda_gate_reg 0.01`): pulls each plugin's *mean* gate toward 0.5, preventing EDAP from being globally bypassed (gate→0) or hard-replacing the backbone (gate→1), while leaving per-token variance free so the gate keeps discriminative power
 - **Stratified validation split**: 20% held out per `correct_source` type (`--val_split 0.2`); early stopping patience=2
 - **Label smoothing**: 0.1 default (`--label_smoothing 0.1`)
 - **`--freeze_lm_head`** (recommended): freezes the 545M lm_head and inserts a small trainable bottleneck, forcing EDAP to learn meaningful routing instead of letting the lm_head memorize dataset biases
@@ -142,7 +142,7 @@ EDAP/
 ## Key Design Decisions
 
 - **Delta-mode K**: attention keys computed from incremental block differences (`s_i − s_{i−1}`), giving higher contrast than raw cumulated vectors. Learnable baseline for source 0 prevents magnitude asymmetry.
-- **Per-token gated mixing**: each token independently blends EDAP-fused output with original block output via a learned sigmoid gate (initialized at 0.5), preventing the plugin from overwriting non-conflict tokens.
+- **Per-token gated mixing**: each token independently blends EDAP-fused output with original block output via a learned sigmoid gate (input LayerNorm-ed, gate initialized near 0.5 with an O(1) logit scale to avoid saturation), preventing the plugin from overwriting non-conflict tokens.
 - **Progressive source count**: EDAP₀ sees 2 sources (emb + block₀), EDAP₆ sees 8 — shallow plugins make simple decisions, deep plugins have full trajectory visibility.
 - **Zero-init W_O**: plugin starts as identity mapping, learns to deviate only where needed.
 - **Shared K/V across plugins** (`--shared_kv`): reduces parameter count ~1/3.

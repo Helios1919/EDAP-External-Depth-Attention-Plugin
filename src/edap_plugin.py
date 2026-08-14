@@ -43,9 +43,14 @@ class EDAPPlugin(nn.Module):
         # by the first source.
         self.baseline = nn.Parameter(torch.zeros(d_model))
 
-        # Per-token soft gate: how much EDAP-fused output vs original block output
+        # Per-token soft gate: how much EDAP-fused output vs original block output.
+        # The raw input [sources[-1], r_out] has RMS ~ 20 and 2*d = 7168 dims, so a
+        # W_gate std of 0.02 would give a gate logit std of ~38.5 -> sigmoid 100%
+        # saturates to 0/1 (hard per-token switch, unstable residual). Fix: LayerNorm
+        # the gate input and scale W_gate so the logit std is ~O(1).
+        self.norm_gate = nn.LayerNorm(d_model * 2)
         self.W_gate = nn.Linear(d_model * 2, 1)
-        nn.init.normal_(self.W_gate.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.W_gate.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.W_gate.bias)
 
         # init W_O near zero so the plugin starts as identity
@@ -133,7 +138,9 @@ class EDAPPlugin(nn.Module):
         r_out = sources[-1] + delta
 
         # -- gate -------------------------------------------------------------
-        gate_input = torch.cat([sources[-1], r_out], dim=-1)  # [B, S, 2*d]
+        gate_input = self.norm_gate(
+            torch.cat([sources[-1], r_out], dim=-1)
+        )  # [B, S, 2*d]
         gate = torch.sigmoid(self.W_gate(gate_input))          # [B, S, 1]
 
         return r_out, weights.squeeze(3), gate
