@@ -1,8 +1,37 @@
 # EDAP: External Depth Attention Plugin
 
-**Plug-in cross-depth attention modules for resolving residual stream conflicts in frozen LLMs.**
+> ⚠️ **Status: negative result.** This project tested one hypothesis — that a
+> *learnable, content-dependent* cross-depth attention / subtraction module can
+> resolve knowledge conflicts in a frozen LLM — and **conclusively falsified it**.
+> The repository is kept as a complete, reproducible record of that finding.
 
-When a language model's parametric (memorized) knowledge contradicts external context (e.g., retrieved documents in RAG), LLMs often default to their internal memory, causing hallucinations. EDAP inserts lightweight, trainable multi-head attention plugins at transformer block boundaries that learn to calibrate trust across depth — explicitly weighting how much to rely on representations from shallow vs. deep layers for a given query.
+**Hypothesis.** When a language model's parametric (memorized) knowledge
+contradicts external context (e.g., retrieved documents in RAG), LLMs often
+default to their internal memory. EDAP proposed inserting lightweight, trainable
+multi-head attention plugins at transformer block boundaries that learn to
+calibrate trust across depth — weighting shallow vs. deep representations per query.
+
+## Summary of findings (TL;DR)
+
+Three frozen-backbone probes (`scripts/`) on Qwen2.5-7B give a closed argument:
+
+| Probe | Question | Result |
+|-------|----------|--------|
+| `oracle_delta.py` | Can *any* hidden-space delta flip the frozen head? | Yes, but only in direction `W[tgt] − W[cur]` (needs the answer), tiny ~3–10% magnitude |
+| `subtractive_probe.py` | Is `h_shallow − h_deep` the right direction? | No — flip rate = random (2.7%) |
+| `logit_router.py` | Does *learned* multi-layer logit subtraction help, and are weights content-dependent? | No — `λ` collapses to 0, weights become content-independent constants |
+
+**Root cause.** On ConFiQA *counterfactual* samples the correct answer is
+`correct_source="memory"` and the context is deliberately misleading. The
+counterfactual context corrupts the model so badly that ~93% of the time its vanilla
+argmax is an unrelated token (neither the memory nor the context answer). In that
+regime no layer's subtraction recovers the answer; the only effective direction
+`W[tgt] − W[cur]` requires knowing the target — i.e. is not learnable.
+
+**Implication.** Cross-depth *subtractive* interventions (CAD, DoLa, and this work)
+only help on "trust the context" conflicts (NQ-Swap), not "trust your memory"
+conflicts (ConFiQA counterfactual). The open problem is **source attribution**
+("which should I trust here?"), not the subtraction mechanism itself.
 
 ## Architecture
 
@@ -125,10 +154,17 @@ EDAP/
 │   └── report.py           # Full comparison report generator
 ├── scripts/
 │   ├── setup.sh            # One-click environment setup
-│   └── convert_confiqa.py  # Convert official ConFiQA splits to training format
+│   ├── convert_confiqa.py  # Convert official ConFiQA splits to training format
+│   ├── oracle_delta.py     # Probe 1: oracle feasibility of hidden-space delta
+│   ├── subtractive_probe.py# Probe 2: is h_shallow − h_deep a useful direction?
+│   └── logit_router.py     # Probe 3: learnable content-dependent logit subtraction
 ├── environment.yml         # Conda environment spec
 ├── requirements.txt        # Pip dependencies
 └── README.md
+
+> **Note:** the probe scripts hard-code the research machine's absolute paths
+> (`/root/EDAP/models`, `/root/EDAP/data`). Point them at your own model/data
+> before running.
 ```
 
 ## Baselines
@@ -151,17 +187,46 @@ EDAP/
 - **Target-entropy regularization**: keeps cross-depth attention informative without collapsing to single-source or uniform routing.
 - **Ablations**: `--shuffle_depth` (randomize block order), `--no_delta`, `--no_gate`, `--no_flip_augmentation`.
 
-## Results
+## Detailed findings
 
-Run `python src/report.py --edap_ckpt <path> --edap_random_ckpt <path>` after training to generate a full comparison report with:
+### Oracle feasibility (`scripts/oracle_delta.py`)
 
-- EM / Prefix-EM breakdown by method (EDAP, EDAP-random, Greedy, CAD, DoLa) and dataset (ConFiQA, NQ-Swap)
-- Per-source-type analysis (context vs. memory)
-- Cross-depth attention heatmaps (EDAP vs. EDAP-random)
-- Failure case analysis (EDAP-wrong / Greedy-right reversals)
-- Success criteria checklist (against `prototype-experiment.md`)
+Even in the *most optimistic* case (frozen backbone + frozen `lm_head`, delta
+injected after RMSNorm), the minimal hidden-state perturbation needed to flip the
+argmax to the target token is only ~3–10% of the hidden-state norm. The direction
+is always `W[tgt] − W[cur]` (the unembedding word-vector difference). Conclusion:
+magnitude is **not** the bottleneck — direction is, and that direction requires
+knowing the target.
 
-Results are saved to `results/` as JSON + Markdown report + attention heatmap.
+### Subtractive direction (`scripts/subtractive_probe.py`)
+
+Injecting `δ = α·(h_shallow − h_deep)` flips the answer at the random rate (~2.7%)
+for all `α`. The "trust context, suppress memory" direction does **not** exist as a
+layer difference in hidden space.
+
+### Learnable logit router (`scripts/logit_router.py`)
+
+`logits = (1+λ)·final − λ·Σ w_ℓ·logits_ℓ` with a content-dependent MHA router over
+reference layers. After training:
+- `λ` went negative and clamped to 0 (the subtraction disengaged),
+- flip rate = vanilla (2.7%),
+- weights `w` were identical for counterfactual vs. context-required samples
+  (`[0.125, 0, 0, 0, 0.25, 0, 0.625]`) — i.e. **content-independent**.
+
+The novelty claim (content-dependent multi-layer subtraction) is falsified: the
+router degenerates to a fixed, content-blind weighting — DoLa with extra steps.
+
+### Context for CAD / DoLa
+
+CAD and DoLa's reported gains come from *trust-the-context* datasets (NQ-Swap:
+44 → 64 → 56). On ConFiQA counterfactual (trust-your-memory) they barely move
+(21 → 27 → 29). See the `results/` baselines for full numbers.
+
+---
+
+The `src/` pipeline (train / evaluate / report) remains usable as a frozen-backbone
+evaluation harness; run `python src/report.py --edap_ckpt <path>` to regenerate the
+comparison tables from a saved checkpoint.
 
 ## License
 
